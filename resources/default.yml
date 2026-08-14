@@ -1,0 +1,65 @@
+
+build:
+  cpus: 4
+  memory: 4096
+  memory_max: 8192
+
+env:
+  TERM: xterm-256color
+
+secrets:
+  - env: GITHUB_TOKEN
+    host-env: $(gh auth token)
+    hosts:
+      - "*.github.com"
+      - "*.githubusercontent.com"
+
+  # - env: OPENAI_API_KEY
+  #   host-env: $OPENAI_API_KEY
+  #   hosts:
+  #      - "api.openai.com"
+
+network:
+  allow_everything: false
+
+  allow_host:
+    - mise.run 
+    - .github.com
+    - .githubusercontent.com
+    - .jdx.dev
+    - .pkgbuild.com
+
+  # deny_host:
+  #   - example.com
+
+
+
+agents:
+  - name: pi
+    package: mise:pi@latest
+    host-copy: 
+      ~/.pi 
+  - name: omp
+    package: github:can1357/oh-my-pi@latest
+    host-copy:
+      ~/.omp
+  - name: codex
+    package: mise:codex@latest
+    host-copy:
+      ~/.claude
+  - name: claude
+    package: mise:claude@latest
+    guest: /root/.pi
+  - name: try
+    package: github:tobi/try@latest
+
+
+layers:
+  - id: dotfiles 
+    script: | 
+      # example: 
+      # curl github.com/your/dotfiles | bash 
+  
+      echo "* You are in the vm's $SHELL"
+      mise list
+      echo
