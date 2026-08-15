@@ -181,4 +181,4 @@ wrap -c DIR ...    # target an existing VM for a method call
 
 ## Status
 
-`wrap` is designed around [microsandbox](https://github.com/can1357/microsandbox) and currently builds an Arch Linux guest with common development tools, mise, zsh, and the configured agents.
+`wrap` is designed around [microsandbox](https://github.com/superradcompany/microsandbox) and currently builds an Arch Linux guest with common development tools, mise, zsh, and the configured agents.
