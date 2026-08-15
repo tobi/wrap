@@ -19,8 +19,7 @@ With [mise](https://mise.jdx.dev/):
 mise u -g --pin github:tobi/wrap
 ```
 
-This uses the GitHub release backend. The repository needs a published release.
-The long form is equivalent:
+This uses the GitHub release backend. Push a `v*` tag to build Linux and macOS release assets. Until a release exists, install from a Rust checkout:
 
 ```bash
 mise use --global --pin github:tobi/wrap
