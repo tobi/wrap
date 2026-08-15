@@ -20,10 +20,12 @@ jobs:
           - name: Linux x86_64
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            features: ''
             asset: wrap-linux-x64
           - name: macOS x86_64
             os: macos-15-intel
             target: x86_64-apple-darwin
+            features: --no-default-features
             asset: wrap-macos-x64
 
     steps:
@@ -47,10 +49,10 @@ jobs:
         run: cargo fmt --check
 
       - name: Run tests
-        run: cargo test --locked --target ${{ matrix.target }}
+        run: cargo test --locked ${{ matrix.features }} --target ${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --locked --release --target ${{ matrix.target }}
+        run: cargo build --locked --release ${{ matrix.features }} --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
