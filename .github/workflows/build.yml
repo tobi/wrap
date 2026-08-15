@@ -22,11 +22,6 @@ jobs:
             target: x86_64-unknown-linux-gnu
             features: ''
             asset: wrap-linux-x64
-          - name: macOS x86_64
-            os: macos-15-intel
-            target: x86_64-apple-darwin
-            features: --no-default-features
-            asset: wrap-macos-x64
 
     steps:
       - name: Check out source
@@ -66,6 +61,23 @@ jobs:
           name: ${{ matrix.asset }}
           path: dist/${{ matrix.asset }}.tar.gz
           if-no-files-found: error
+
+  macos-preview:
+    name: macOS preview (upstream dependency)
+    runs-on: macos-15-intel
+    continue-on-error: true
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Check macOS compilation
+        run: cargo check --locked --no-default-features --target x86_64-apple-darwin
 
   release:
     name: Publish release assets

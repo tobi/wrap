@@ -19,7 +19,7 @@ With [mise](https://mise.jdx.dev/):
 mise u -g --pin github:tobi/wrap
 ```
 
-This uses the GitHub release backend. Push a `v*` tag to build Linux and macOS release assets. Until a release exists, install from a Rust checkout:
+This uses the GitHub release backend. Push a `v*` tag to build the Linux release asset. macOS compilation is tracked separately while the upstream microsandbox dependency is repaired. Until a release exists, install from a Rust checkout:
 
 ```bash
 mise use --global --pin github:tobi/wrap
