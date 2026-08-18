@@ -40,7 +40,7 @@ cd ~/src/my-project
 wrap
 ```
 
-The current directory is mounted in the VM as `/workspace`. The VM has a normal Arch development environment and is cached by workspace, so later starts are quick. The base image is shared; your project VM is separate.
+The current directory is mounted in the VM as `/workspace`. The VM starts from the shared published base container and is cached by workspace, so later starts are quick. The base snapshot is shared; your project VM is separate.
 
 Run one command without opening a shell:
 
@@ -117,7 +117,7 @@ wrap -c "$PWD" read src/main.rs:40:10
 
 ## Network and credentials
 
-The VM starts with a default-deny network policy. Project traffic is limited to the configured allowlist, which includes GitHub by default. The image build also uses the package infrastructure required to install the base environment.
+The VM starts with a default-deny network policy. Project traffic is limited to the configured allowlist, which includes GitHub by default. Custom layers and agents are applied after the published base container is loaded.
 
 You can add or remove allowed hosts in the wrap configuration. A project does not inherit the host's unrestricted network access.
 
@@ -181,4 +181,4 @@ wrap -c DIR ...    # target an existing VM for a method call
 
 ## Status
 
-`wrap` is designed around [microsandbox](https://github.com/superradcompany/microsandbox) and currently builds an Arch Linux guest with common development tools, mise, zsh, and the configured agents.
+`wrap` is designed around [microsandbox](https://github.com/superradcompany/microsandbox) and starts from the `ghcr.io/tobi/wrap:latest` Arch Linux container with common development tools, mise, zsh, and configured agents layered on top.

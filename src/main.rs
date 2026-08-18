@@ -25,35 +25,9 @@ use sha2::{Digest, Sha256};
 use ui::{CrossingKind, Live, Ui};
 
 pub(crate) const WORKSPACE: &str = "/workspace";
-const IMAGE: &str = "archlinux";
-const BASE_SNAPSHOT_PREFIX: &str = "wrap-arch";
+const IMAGE: &str = "ghcr.io/tobi/wrap:latest";
+const BASE_SNAPSHOT_PREFIX: &str = "wrap-image";
 const BASE_LAYOUT_LABEL: &str = "wrap.base-layout";
-const STARSHIP_TOML: &str = include_str!("../resources/starship.toml");
-const BASE_PACKAGES: &[&str] = &[
-    "archlinux-keyring",
-    "base-devel",
-    "ca-certificates",
-    "clang",
-    "cmake",
-    "curl",
-    "eza",
-    "fd",
-    "gdb",
-    "git",
-    "gnupg",
-    "mise",
-    "ninja",
-    "openssh",
-    "python",
-    "python-pip",
-    "ripgrep",
-    "sudo",
-    "tar",
-    "unzip",
-    "which",
-    "zsh",
-];
-const BASE_MISE_TOOLS: &[&str] = &["ruby@latest", "starship@latest"];
 const SESSION_MEMORY_MIN_MIB: u32 = 4096;
 const ROOT_DISK_GIB: u32 = 16;
 static HOST_COPY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -204,7 +178,7 @@ struct BuildStage {
 
 fn build_stages(cfg: &config::Config) -> Result<Vec<BuildStage>> {
     let mut definitions = Vec::with_capacity(cfg.layers.len() + 2);
-    definitions.push(("system".to_string(), arch_system_script()));
+    definitions.push(("image".to_string(), build_script("true")));
     if !cfg.agents.is_empty() {
         definitions.push(("agents".to_string(), mise_agents_script(&cfg.agents)?));
     }
@@ -240,67 +214,9 @@ fn build_stages(cfg: &config::Config) -> Result<Vec<BuildStage>> {
         .collect())
 }
 
-fn arch_system_script() -> String {
-    let mut script = build_script(
-        r#"if ! command -v pacman >/dev/null 2>&1; then
-  echo "wrap requires its built-in Arch image" >&2
-  exit 1
-fi
-pacman-key --init || true
-pacman-key --populate archlinux || true
-pacman -Sy --noconfirm archlinux-keyring
-pacman -Syu --noconfirm
-pacman -S --needed --noconfirm --"#,
-    );
-    for package in BASE_PACKAGES {
-        push_shell_arg(&mut script, package);
-    }
-    script.push_str(
-        r#"
-if ! grep -qx '/bin/zsh' /etc/shells 2>/dev/null; then
-  echo /bin/zsh >> /etc/shells
-fi
-if ! grep -qx '/usr/bin/zsh' /etc/shells 2>/dev/null; then
-  echo /usr/bin/zsh >> /etc/shells
-fi
-chsh -s /bin/zsh root || true
-mkdir -p /workspace /root/.omp /etc/zsh /etc/wrap
-cat > /etc/profile.d/wrap.sh <<'WRAP_ENV'
-export PATH="/usr/local/bin:/root/.local/bin:/root/.local/share/mise/shims:$PATH"
-export STARSHIP_CONFIG=/etc/wrap/starship.toml
-WRAP_ENV
-cat > /etc/wrap/starship.toml <<'WRAP_STARSHIP'
-"#,
-    );
-    script.push_str(STARSHIP_TOML);
-    script.push_str(
-        r#"WRAP_STARSHIP
-cat > /etc/zsh/zshenv <<'WRAP_ZSH'
-export PATH="/usr/local/bin:/root/.local/bin:/root/.local/share/mise/shims:$PATH"
-export STARSHIP_CONFIG=/etc/wrap/starship.toml
-if [[ -o interactive && -t 1 ]]; then
-  eval "$(/usr/bin/mise activate zsh)"
-  eval "$(starship init zsh)"
-  if command -v try >/dev/null 2>&1; then
-    eval "$(try init)"
-    alias t=try
-  fi
-fi
-WRAP_ZSH
-"#,
-    );
-    script
-}
-
 fn mise_agents_script(agents: &[config::AgentSpec]) -> Result<String> {
     let mut script = build_script("mise use --global --pin --yes --jobs 4 --");
     let mut seen = std::collections::BTreeSet::new();
-    for package in BASE_MISE_TOOLS {
-        let package = (*package).to_string();
-        if seen.insert(package.clone()) {
-            push_shell_arg(&mut script, &package);
-        }
-    }
     for agent in agents {
         let package = mise_install_package(&agent.package)?;
         if seen.insert(package.clone()) {
@@ -1138,7 +1054,7 @@ mod tests {
                 .iter()
                 .map(|stage| stage.id.as_str())
                 .collect::<Vec<_>>(),
-            ["system", "agents", "dotfiles"]
+            ["image", "agents", "dotfiles"]
         );
         for (index, stage) in stages.iter().enumerate() {
             assert!(stage.snapshot.starts_with(&format!(
@@ -1147,27 +1063,18 @@ mod tests {
                 stage.id
             )));
         }
-        assert!(stages[0].script.contains("pacman -Syu --noconfirm"));
-        assert!(
-            stages[0]
-                .script
-                .contains("pacman -S --needed --noconfirm -- archlinux-keyring")
+        assert!(!stages[0].script.contains("pacman"));
+        assert_eq!(
+            stages[0].script.trim_end(),
+            "set -eu\nexport HOME=/root\nexport USER=root\nexport PATH=\"/root/.local/bin:/root/.local/share/mise/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\"\ntrue"
         );
-        assert!(stages[0].script.contains("python python-pip ripgrep sudo"));
-        assert!(
-            stages[0]
-                .script
-                .contains("STARSHIP_CONFIG=/etc/wrap/starship.toml")
-        );
-        assert!(stages[0].script.contains("eval \"$(starship init zsh)\""));
-        assert!(stages[0].script.contains("[vm:$hostname"));
         assert_eq!(
             stages[1].script.matches("mise use --global --pin").count(),
             1
         );
         assert!(stages[1].script.contains("'pi@latest'"));
-        assert!(stages[1].script.contains("'ruby@latest'"));
-        assert!(stages[1].script.contains("'starship@latest'"));
+        assert!(!stages[1].script.contains("ruby@latest"));
+        assert!(!stages[1].script.contains("starship@latest"));
         assert!(stages[2].script.contains("echo custom"));
         for stage in &stages {
             assert!(
@@ -1192,11 +1099,11 @@ mod tests {
     }
 
     #[test]
-    fn system_stage_is_final_without_customization() {
+    fn image_stage_is_final_without_customization() {
         let cfg: config::Config = serde_yaml::from_str("{}").unwrap();
         let stages = build_stages(&cfg).unwrap();
         assert_eq!(stages.len(), 1);
-        assert!(stages[0].snapshot.starts_with("wrap-arch-01-system-"));
+        assert!(stages[0].snapshot.starts_with("wrap-image-01-image-"));
     }
 
     #[test]
