@@ -181,6 +181,17 @@ agents:
     host-copy: ~/.omp
 ```
 
+`pull_policy` controls when the image stage contacts the registry. It defaults
+to `Always`, so a first build or `--rebuild` picks up the current tag. Set it to
+`IfMissing` to boot from an image that exists only in the local msb cache (for
+example one built locally and imported with `msb load`), or `Never` to fail
+rather than contact a registry:
+
+```yaml
+image: wrap-arm64:local
+pull_policy: IfMissing
+```
+
 Host values can come from a literal, an environment variable, or a command:
 
 ```yaml

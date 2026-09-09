@@ -18,6 +18,9 @@ pub struct Config {
     /// OCI image the shared base snapshot is built from.
     #[serde(default = "default_image")]
     pub image: String,
+    /// When the image stage contacts the registry for manifest freshness.
+    #[serde(default)]
+    pub pull_policy: PullPolicy,
     #[serde(default)]
     pub build: BuildConfig,
     #[serde(default)]
@@ -30,6 +33,24 @@ pub struct Config {
     pub agents: Vec<AgentSpec>,
     #[serde(default)]
     pub layers: Vec<LayerSpec>,
+}
+
+/// Registry pull behaviour for the image stage of the base snapshot.
+///
+/// `Always` is the default because the image stage only runs on first build or
+/// `--rebuild`, and both normally want the registry's current tag rather than
+/// a stale local one. `IfMissing` is what makes a locally built image usable:
+/// a tag imported with `msb load` exists only in the local cache, so any
+/// registry round trip fails.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+pub enum PullPolicy {
+    /// Re-check the registry manifest, reusing layers whose digests match.
+    #[default]
+    Always,
+    /// Reuse a fully cached image; contact the registry only when it is missing.
+    IfMissing,
+    /// Never contact the registry; fail when the image is not fully cached.
+    Never,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -488,6 +509,27 @@ mod tests {
         let try_agent = cfg.agents.iter().find(|agent| agent.name == "try").unwrap();
         assert_eq!(try_agent.package, "github:tobi/try@latest");
         assert_eq!(cfg.layers[0].id, "dotfiles");
+        assert_eq!(cfg.pull_policy, PullPolicy::Always);
+    }
+
+    #[test]
+    fn pull_policy_defaults_to_always_and_is_selectable() {
+        // Defaulting to Always is load-bearing: dropping it would silently let
+        // a stale cached base image outlive the registry tag it came from.
+        let cfg: Config = serde_yaml::from_str("{}\n").unwrap();
+        assert_eq!(cfg.pull_policy, PullPolicy::Always);
+
+        let cfg: Config = serde_yaml::from_str("pull_policy: IfMissing\n").unwrap();
+        assert_eq!(cfg.pull_policy, PullPolicy::IfMissing);
+
+        let cfg: Config = serde_yaml::from_str("pull_policy: Never\n").unwrap();
+        assert_eq!(cfg.pull_policy, PullPolicy::Never);
+    }
+
+    #[test]
+    fn rejects_pull_policy_that_is_not_a_literal_variant_name() {
+        let err = serde_yaml::from_str::<Config>("pull_policy: if-missing\n").unwrap_err();
+        assert!(err.to_string().contains("unknown variant"));
     }
 
     #[test]

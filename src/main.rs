@@ -399,12 +399,13 @@ async fn build_layer(
     builder = if let Some(snapshot) = parent {
         builder.from_snapshot(snapshot)
     } else {
-        // The image stage only runs on first build or --rebuild; both want the
-        // registry's current `latest`, not a stale local tag. Always re-checks
-        // the manifest and only fetches layers whose digests changed.
+        // The image stage only runs on first build or --rebuild; both normally
+        // want the registry's current `latest`, not a stale local tag, which is
+        // why `pull_policy` defaults to Always. Set it to `IfMissing` to run
+        // from a locally built image that exists only in the msb cache.
         builder
             .image_with(|i| i.oci(cfg.image.as_str()).root_disk(ROOT_DISK_GIB.gib()))
-            .pull_policy(PullPolicy::Always)
+            .pull_policy(image_pull_policy(cfg))
     };
     builder = apply_secrets(builder, secrets);
 
@@ -795,26 +796,7 @@ async fn install_agent_shims(sandbox: &Sandbox, cfg: &config::Config) -> Result<
 /// writable for the unprivileged session without chowning host files (which
 /// would otherwise leave `user.msb.override_stat` xattrs on every file).
 async fn align_guest_identity(sandbox: &Sandbox, identity: HostIdentity) -> Result<()> {
-    let script = format!(
-        "set -eu\n\
-         uid={uid}; gid={gid}\n\
-         cur_gid=$(getent group {user} | cut -d: -f3)\n\
-         if [ \"$cur_gid\" != \"$gid\" ]; then\n\
-           if getent group \"$gid\" >/dev/null; then groupmod -o -g \"$gid\" {user}; else groupmod -g \"$gid\" {user}; fi\n\
-         fi\n\
-         cur_uid=$(id -u {user})\n\
-         if [ \"$cur_uid\" != \"$uid\" ]; then usermod -o -u \"$uid\" -g \"$gid\" {user}; fi\n\
-         # Everything `user` owns follows the id change: home and the toolchain.\n\
-         if [ \"$cur_uid\" != \"$uid\" ] || [ \"$cur_gid\" != \"$gid\" ]; then\n\
-           chown -R \"$uid:$gid\" {home} {mise}\n\
-         fi\n",
-        uid = identity.uid,
-        gid = identity.gid,
-        user = GUEST_USER,
-        home = shell_quote(GUEST_HOME),
-        mise = shell_quote("/opt/mise"),
-    );
-    let output = root_shell(sandbox, script)
+    let output = root_shell(sandbox, align_identity_script(identity))
         .await
         .context("align guest user identity")?;
     if !output.status().success {
@@ -826,6 +808,43 @@ async fn align_guest_identity(sandbox: &Sandbox, identity: HostIdentity) -> Resu
         );
     }
     Ok(())
+}
+
+/// Script for [`align_guest_identity`], kept separate so the toolchain
+/// fallback below stays testable without a running sandbox.
+fn align_identity_script(identity: HostIdentity) -> String {
+    format!(
+        "set -eu\n\
+         uid={uid}; gid={gid}\n\
+         cur_gid=$(getent group {user} | cut -d: -f3)\n\
+         if [ \"$cur_gid\" != \"$gid\" ]; then\n\
+           if getent group \"$gid\" >/dev/null; then groupmod -o -g \"$gid\" {user}; else groupmod -g \"$gid\" {user}; fi\n\
+         fi\n\
+         cur_uid=$(id -u {user})\n\
+         if [ \"$cur_uid\" != \"$uid\" ]; then usermod -o -u \"$uid\" -g \"$gid\" {user}; fi\n\
+         # Home follows the id change; it is a handful of files.\n\
+         if [ \"$cur_uid\" != \"$uid\" ] || [ \"$cur_gid\" != \"$gid\" ]; then\n\
+           chown -R \"$uid:$gid\" {home}\n\
+           # The toolchain is the expensive case: every chowned path is one\n\
+           # overlay copy-up (~11 ms per file, so ~5 min for the stock 28.5k\n\
+           # file tree on macOS/arm64). Current images avoid it by group-owning\n\
+           # /opt/mise with `toolchain` and making it group-writable, which\n\
+           # survives the realignment because supplementary groups do. Images\n\
+           # that still gate the toolchain on ownership fall back to the chown,\n\
+           # and a probe that cannot run fails, which errs toward the chown.\n\
+           # `runuser` rather than `su`: it is the root-only variant that skips\n\
+           # PAM authentication, which `su` fails on this passwordless account.\n\
+           if ! runuser -u {user} -- sh -c 'test -w {mise} && test -w {mise_data}' 2>/dev/null; then\n\
+             chown -R \"$uid:$gid\" {mise}\n\
+           fi\n\
+         fi\n",
+        uid = identity.uid,
+        gid = identity.gid,
+        user = GUEST_USER,
+        home = shell_quote(GUEST_HOME),
+        mise = shell_quote("/opt/mise"),
+        mise_data = shell_quote(MISE_DATA_DIR),
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1085,6 +1104,14 @@ fn apply_secrets(
     builder
 }
 
+fn image_pull_policy(cfg: &config::Config) -> PullPolicy {
+    match cfg.pull_policy {
+        config::PullPolicy::Always => PullPolicy::Always,
+        config::PullPolicy::IfMissing => PullPolicy::IfMissing,
+        config::PullPolicy::Never => PullPolicy::Never,
+    }
+}
+
 fn session_policy(cfg: &config::Config) -> Result<NetworkPolicy, microsandbox::MicrosandboxError> {
     let (allow_domains, allow_suffixes) = classify_hosts(&cfg.network.allow_host);
     let (deny_domains, deny_suffixes) = classify_hosts(&cfg.network.deny_host);
@@ -1295,6 +1322,40 @@ mod tests {
         assert_ne!(a, c);
         assert!(a.starts_with("wrap-"));
         assert_eq!(a.len(), "wrap-".len() + 16);
+    }
+
+    #[test]
+    fn identity_alignment_gates_the_toolchain_chown_on_writability() {
+        let script = align_identity_script(HostIdentity { uid: 501, gid: 20 });
+        // Home is chowned unconditionally inside the realignment branch: it is
+        // a handful of files. The toolchain chown must stay behind the probe,
+        // because each chowned file is an overlay copy-up, which is minutes of
+        // cold start for the stock toolchain rather than milliseconds.
+        assert!(script.contains("chown -R \"$uid:$gid\" /home/user\n"));
+        let probe = "if ! runuser -u user -- sh -c 'test -w /opt/mise && test -w /opt/mise/data' 2>/dev/null; then";
+        assert!(script.contains(probe), "{script}");
+        let (_, guarded) = script.split_once(probe).unwrap();
+        assert!(
+            guarded
+                .trim_start()
+                .starts_with("chown -R \"$uid:$gid\" /opt/mise"),
+            "the toolchain chown must be inside the probe, not next to it: {guarded}"
+        );
+    }
+
+    #[test]
+    fn image_pull_policy_follows_config() {
+        // The mapping is what lets a local-only image tag boot at all; a wrong
+        // arm on either side sends the image stage back to the registry.
+        let cfg: config::Config =
+            serde_yaml::from_str(include_str!("../resources/default.yml")).unwrap();
+        assert_eq!(image_pull_policy(&cfg), PullPolicy::Always);
+
+        let cfg: config::Config = serde_yaml::from_str("pull_policy: IfMissing\n").unwrap();
+        assert_eq!(image_pull_policy(&cfg), PullPolicy::IfMissing);
+
+        let cfg: config::Config = serde_yaml::from_str("pull_policy: Never\n").unwrap();
+        assert_eq!(image_pull_policy(&cfg), PullPolicy::Never);
     }
 
     #[test]
