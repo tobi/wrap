@@ -241,8 +241,10 @@ pub struct SecretSpec {
     /// (e.g. `Authorization: "Bearer $GH_TOKEN"`, `X-Api-Token: $TOKEN`).
     /// Values reference guest env vars holding [`SECRET_PLACEHOLDER`], which
     /// microsandbox substitutes on matching traffic. A secret with entries
-    /// here gets header injection; a declared `Authorization` header covering
-    /// github.com additionally doubles as git's http.extraheader.
+    /// here gets header injection. A declared `Authorization` header covering
+    /// github.com also authenticates guest git: wrap sets git's
+    /// http.extraheader to Basic `x-access-token:<stand-in>`, because
+    /// GitHub's git endpoints reject Bearer.
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     /// Host → `{allow: true}`. Allowed hosts of live secrets fold into the

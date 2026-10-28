@@ -15,6 +15,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use clap::Parser;
 use microsandbox::{
     ExecEvent, LogLevel, NetworkPolicy, NetworkProfile, Sandbox, Snapshot,
@@ -1646,7 +1647,10 @@ fn apply_secrets(
                 // Declared headers ride header injection as placeholder
                 // substitution; per-tool config (e.g. git's http.extraheader,
                 // written at session entry) makes guest tools send them.
-                s = s.inject_headers(true);
+                // git's GitHub header is Basic, which hides the stand-in
+                // inside base64; Basic-auth injection decodes it, swaps in
+                // the real value and re-encodes it.
+                s = s.inject_headers(true).inject_basic_auth(true);
             }
             s
         });
@@ -1782,10 +1786,11 @@ fn guest_command(cfg: &config::Config, command: &[String]) -> (String, Vec<Strin
 }
 
 /// The first live secret declaring an `Authorization` header for exactly
-/// `github.com` provides git's http.extraheader (header name and value
-/// template). The value references a guest env var, so the shell expands it
-/// to the stand-in at entry time and header injection substitutes the real
-/// token on the wire.
+/// `github.com` authenticates guest git: git's http.extraheader keeps the
+/// declared header name, but its value is always [`github_git_authorization`]
+/// rather than the declared template. GitHub's git endpoints refuse Bearer
+/// (401, even for public repos), and the stand-in is a constant, so the
+/// value needs no guest expansion.
 fn github_extraheader(secrets: &config::ResolvedSecrets) -> Option<(String, String)> {
     secrets.found.iter().find_map(|secret| {
         if !secret.hosts.iter().any(|host| host == "github.com") {
@@ -1793,10 +1798,19 @@ fn github_extraheader(secrets: &config::ResolvedSecrets) -> Option<(String, Stri
         }
         secret
             .headers
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
-            .map(|(name, value)| (name.clone(), value.clone()))
+            .keys()
+            .find(|name| name.eq_ignore_ascii_case("authorization"))
+            .map(|name| (name.clone(), github_git_authorization()))
     })
+}
+
+/// Basic credentials with the token as the password, the form GitHub's git
+/// endpoints accept. They encode the stand-in; microsandbox's Basic-auth
+/// injection decodes them, substitutes the real token and re-encodes them on
+/// the wire.
+fn github_git_authorization() -> String {
+    let credentials = format!("x-access-token:{}", config::SECRET_PLACEHOLDER);
+    format!("Basic {}", BASE64.encode(credentials))
 }
 
 fn secrets_need_git_header(command: &[String], secrets: &config::ResolvedSecrets) -> bool {
@@ -2125,9 +2139,10 @@ mod tests {
             &["github.com"],
         )]);
         assert!(secrets_need_git_header(&[], &live));
+        // git gets Basic, never the declared Bearer template.
         assert_eq!(
             github_extraheader(&live),
-            Some(("Authorization".to_string(), "Bearer $GH_TOKEN".to_string()))
+            Some(("Authorization".to_string(), github_git_authorization()))
         );
         assert!(!secrets_need_git_header(&["true".to_string()], &live));
         // No secrets, no Authorization header, or no github.com host.
@@ -2148,7 +2163,26 @@ mod tests {
         )]);
         assert_eq!(
             github_extraheader(&lower),
-            Some(("authorization".to_string(), "Bearer $GH_TOKEN".to_string()))
+            Some(("authorization".to_string(), github_git_authorization()))
+        );
+    }
+
+    #[test]
+    fn git_authorization_is_basic_access_token_with_the_stand_in() {
+        let value = github_git_authorization();
+        let encoded = value
+            .strip_prefix("Basic ")
+            .expect("GitHub's git endpoints only accept Basic");
+        let decoded = String::from_utf8(BASE64.decode(encoded).unwrap()).unwrap();
+        assert_eq!(
+            decoded,
+            format!("x-access-token:{}", config::SECRET_PLACEHOLDER)
+        );
+        // Safe inside the double-quoted `git config` command.
+        assert!(
+            encoded
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "+/=".contains(c))
         );
     }
 

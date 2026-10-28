@@ -41,9 +41,10 @@ env:
 # - headers:  outgoing header templates carrying the credential, as
 #             name → value (e.g. `Authorization: "Bearer $GH_TOKEN"`,
 #             `X-Api-Key: $ANTHROPIC_API_KEY`). A secret with entries here
-#             gets header injection; a declared `Authorization` header
-#             covering github.com additionally doubles as git's
-#             http.extraheader.
+#             gets header injection. A declared `Authorization` header
+#             covering github.com also authenticates guest git: wrap sets
+#             git's http.extraheader to Basic `x-access-token:<stand-in>`,
+#             because GitHub's git endpoints reject Bearer.
 # - hosts:    map of host → `{allow: true}`. Only the allowed hosts of live
 #             (resolved) secrets fold into the network allowlist; a skipped
 #             secret whitelists nothing and `network.deny` still wins.
