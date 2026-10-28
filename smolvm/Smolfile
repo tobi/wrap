@@ -1,0 +1,50 @@
+# wrap as a Smolfile: the same image, user, workspace mount, agents and
+# default-deny network, in a smolvm machine. Credentials stay on the host.
+#
+#   smolvm machine create --name proj -s path/to/Smolfile   # from the project dir
+#   GH_TOKEN="Basic $(printf 'x-access-token:%s' "$(gh auth token)" | base64 | tr -d '\n')" \
+#     smolvm machine start --name proj                      # reads credentials from here
+#   smolvm machine exec --name proj -it -- zsh -l
+#
+# ./smolwrap does those three steps per directory, like `wrap`.
+image = "ghcr.io/tobi/wrap:latest"
+cpus = 2
+memory = 8192
+
+user = "user"
+workdir = "/home/user/workspace"
+volumes = [".:/home/user/workspace"]   # the directory you create the machine from
+
+# Keep the machine up between sessions (the image entrypoint drops to `user`).
+cmd = ["sleep", "infinity"]
+
+# First start only, as root: install the agents as `user` into the image's mise tree.
+init = [
+  "/opt/wrap/bin/wrap-entrypoint mise use --global --pin --yes --jobs 4 -- pi@latest github:can1357/oh-my-pi@latest codex@latest claude@latest",
+]
+
+[network]
+# wrap's allowlist (each entry also allows its subdomains); everything else is denied.
+allow_hosts = [
+  "mise.run", "github.com", "jdx.dev", "npmjs.org", "nodejs.org", "go.dev",
+  "dl.google.com", "pkgbuild.com", "pythonhosted.org", "pypi.org", "pypi.python.org",
+  "r2.dev", "rust-lang.org", "rustup.rs", "sigstore.dev", "api.anthropic.com",
+]
+allow_host_patterns = ["*.githubusercontent.com", "*.githubassets.com"]
+
+# GitHub: the host sets the whole Authorization header, so git, gh and mise
+# authenticate with no guest config. git needs Basic (it rejects Bearer), so
+# the host's GH_TOKEN is "Basic " + base64("x-access-token:<token>"). The guest
+# only gets a placeholder in GH_TOKEN, which is enough for gh to act logged in.
+[[network.credentials]]
+name = "github"
+environment_variable = "GH_TOKEN"
+allowed_hosts = ["github.com", "api.github.com"]
+set_header = "authorization"
+
+# pi: the guest's ANTHROPIC_API_KEY is a placeholder; the host swaps in its own
+# ANTHROPIC_API_KEY on requests to api.anthropic.com only.
+[[network.credentials]]
+name = "anthropic"
+environment_variable = "ANTHROPIC_API_KEY"
+allowed_hosts = ["api.anthropic.com"]

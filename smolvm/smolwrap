@@ -1,0 +1,24 @@
+#!/bin/sh
+# wrap's workflow on smolvm, using the Smolfile next to this script.
+#   smolwrap            login zsh in this directory's machine
+#   smolwrap -- CMD...  run CMD there
+set -eu
+here=$(dirname "$(readlink -f "$0")")
+dir=$(pwd -P)
+base=$(basename "$dir" | tr -cs 'A-Za-z0-9' '-' | cut -c1-40 | sed 's/^-*//; s/-*$//')
+name="${base:-wrap}-$(printf %s "$dir" | cksum | cut -c1-6)"
+
+# One machine per directory; it mounts the directory it was created from.
+smolvm machine status --name "$name" >/dev/null 2>&1 ||
+  smolvm machine create --name "$name" -s "$here/Smolfile" >/dev/null
+
+# Credentials are read from this environment when the machine starts
+# (a no-op when it is already running): GitHub from gh, pi's ANTHROPIC_API_KEY as is.
+token=$(gh auth token)
+GH_TOKEN="Basic $(printf 'x-access-token:%s' "$token" | base64 | tr -d '\n')" \
+  smolvm machine start --name "$name" >&2
+
+[ "${1:-}" = "--" ] && shift
+[ $# -gt 0 ] || set -- zsh -l
+t=; [ -t 0 ] && [ -t 1 ] && t=-t
+exec smolvm machine exec --name "$name" -i $t -- "$@"
