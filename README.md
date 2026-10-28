@@ -201,6 +201,29 @@ agents:
     host-copy: ~/.omp
 ```
 
+`sandbox.pull_policy` controls when the image stage contacts the registry. It defaults
+to `Always`, so a first build or `--rebuild` picks up the current tag. Set it to
+`IfMissing` to boot from an image that exists only in the local msb cache (for
+example one built locally and imported with `msb load`), or `Never` to fail
+rather than contact a registry:
+
+```yaml
+sandbox:
+  image: wrap-arm64:local
+  pull_policy: IfMissing
+```
+
+On Apple Silicon, build the ARM variant locally and import it into the msb cache:
+
+```bash
+docker buildx build --platform linux/arm64 --load -f Containerfile.arm64 -t wrap-arm64:local .
+docker save wrap-arm64:local -o /tmp/wrap-arm64.tar
+msb load --input /tmp/wrap-arm64.tar
+```
+
+Use the configuration above to select it. The published base and desktop images
+remain amd64-only; `Containerfile.desktop` is not covered by the ARM variant.
+
 A workspace-local layer comes from `wrap init`, which writes a starter `WRAPFILE` in the current workspace and exits without booting a VM:
 
 ```bash

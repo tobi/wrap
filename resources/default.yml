@@ -19,6 +19,11 @@ sandbox:
   # Base image. `ghcr.io/tobi/wrap:desktop` adds XFCE on :1, Chrome with CDP
   # and agent-browser attached to it (see Containerfile.desktop).
   image: ghcr.io/tobi/wrap:latest
+  # When the image stage contacts the registry: `Always` re-checks the manifest
+  # (first build and --rebuild only), `IfMissing` reuses a fully cached image,
+  # which is required for a locally built tag imported with `msb load`, and
+  # `Never` fails unless the image is already cached.
+  pull_policy: Always
   # vCPUs for build and session VMs.
   cpus: 2
   # Initial guest memory in MiB.

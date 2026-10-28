@@ -201,12 +201,33 @@ pub struct Config {
     pub layers: Vec<LayerSpec>,
 }
 
+/// Registry pull behaviour for the image stage of the base snapshot.
+///
+/// `Always` is the default because the image stage only runs on first build or
+/// `--rebuild`, and both normally want the registry's current tag rather than
+/// a stale local one. `IfMissing` is what makes a locally built image usable:
+/// a tag imported with `msb load` exists only in the local cache, so any
+/// registry round trip fails.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+pub enum PullPolicy {
+    /// Re-check the registry manifest, reusing layers whose digests match.
+    #[default]
+    Always,
+    /// Reuse a fully cached image; contact the registry only when it is missing.
+    IfMissing,
+    /// Never contact the registry; fail when the image is not fully cached.
+    Never,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SandboxConfig {
     /// OCI image the shared base snapshot is built from.
     #[serde(default = "default_image")]
     pub image: String,
+    /// When the image stage contacts the registry for manifest freshness.
+    #[serde(default)]
+    pub pull_policy: PullPolicy,
     /// vCPUs for build and session VMs.
     #[serde(default = "default_cpus")]
     pub cpus: u8,
@@ -222,6 +243,7 @@ impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
             image: default_image(),
+            pull_policy: PullPolicy::default(),
             cpus: default_cpus(),
             memory: default_memory(),
             memory_max: default_memory_max(),
@@ -1065,6 +1087,7 @@ mod tests {
             Some("$ANTHROPIC_API_KEY")
         );
         assert_eq!(cfg.agents[0].package, "mise:pi@latest");
+        assert_eq!(cfg.sandbox.pull_policy, PullPolicy::Always);
         // Host agent dirs are opt-in; the commented `host-copy` examples
         // must not copy anything by default.
         assert!(cfg.agents.iter().all(|agent| agent.host_copy.is_none()));
@@ -1112,12 +1135,43 @@ mod tests {
     }
 
     #[test]
+    fn pull_policy_defaults_to_always_and_is_selectable() {
+        // Defaulting to Always is load-bearing: dropping it would silently let
+        // a stale cached base image outlive the registry tag it came from.
+        let cfg: Config = serde_yaml::from_str("{}\n").unwrap();
+        assert_eq!(cfg.sandbox.pull_policy, PullPolicy::Always);
+        let cfg: Config = serde_yaml::from_str("sandbox: {}\n").unwrap();
+        assert_eq!(cfg.sandbox.pull_policy, PullPolicy::Always);
+
+        for (value, policy) in [
+            ("IfMissing", PullPolicy::IfMissing),
+            ("Never", PullPolicy::Never),
+        ] {
+            let cfg: Config =
+                serde_yaml::from_str(&format!("sandbox:\n  pull_policy: {value}\n")).unwrap();
+            assert_eq!(cfg.sandbox.pull_policy, policy);
+            // `wrap config` serializes the nested setting without changing it.
+            let yaml = serde_yaml::to_string(&cfg).unwrap();
+            let round_trip: Config = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(round_trip.sandbox.pull_policy, policy);
+        }
+    }
+
+    #[test]
+    fn rejects_pull_policy_that_is_not_a_literal_variant_name() {
+        let err =
+            serde_yaml::from_str::<Config>("sandbox:\n  pull_policy: if-missing\n").unwrap_err();
+        assert!(err.to_string().contains("unknown variant"));
+    }
+
+    #[test]
     fn rejects_legacy_and_unknown_keys() {
         let err = serde_yaml::from_str::<Config>("base_image: archlinux\n").unwrap_err();
         assert!(err.to_string().contains("unknown field `base_image`"));
         // The old flat image/build shape and old secret/network keys are gone.
         for yaml in [
             "image: ghcr.io/tobi/wrap:latest\n",
+            "pull_policy: IfMissing\n",
             "build:\n  cpus: 4\n",
             "network:\n  allow_host: [example.com]\n",
             "network:\n  deny_host: [example.com]\n",
