@@ -63,6 +63,59 @@ RUN pacman -Syu --noconfirm --needed \
 RUN install -d /etc/dconf/profile \
  && printf '%s\n' 'user-db:user' > /etc/dconf/profile/user
 
+# mise's installs are shared by every bot HOME (MISE_DATA_DIR), but its cache,
+# state and locks default to $HOME. So four bots launching a tool with an update
+# pending take four different locks and race over the one shared install —
+# measured on this image: 3 of 4 launches died with "No executable found for
+# configured tool: agent-desktop" while another process replaced it. One
+# directory per uid, under a sticky parent, gives every process of a uid the
+# same lock domain wherever HOME points, and keeps root in its own: the base
+# image's per-uid defaults exist so a sudo shell cannot poison the user's
+# install state, and this keeps that true.
+#
+# The pin is a snippet two entry points share: /etc/profile.d/wrap.sh (login
+# shells, and every zsh through /etc/zsh/zshenv) and wrap-desktop, which sources
+# it before it starts XFCE, a terminal or Chrome — those are not login shells
+# either. This runs before the eager `mise install` below, so the image's own
+# install populates the same cache and state a plain first call uses; an empty
+# state directory would make that call re-resolve and, offline, stall.
+RUN install -d -m 1777 /opt/mise/cache /opt/mise/state \
+ && cat > /opt/wrap/bin/wrap-mise-env <<'EOF'
+# mise: one cache and state directory per uid, independent of HOME. Sourced by
+# /etc/profile.d/wrap.sh and by wrap-desktop, so a bot's commands and the
+# desktop's own processes share the uid's install lock instead of racing.
+#  - [ -O ]: a directory that is not ours is left alone. Root and the user never
+#    write into each other's state, and a root-owned leftover is not adopted.
+#  - the snippet never fails a shell: every step that can fail ends in `continue`.
+for kind in cache state; do
+  case $kind in
+    cache) var=MISE_CACHE_DIR ;;
+    state) var=MISE_STATE_DIR ;;
+  esac
+  dir="/opt/mise/$kind/$(id -u)"
+  [ -d "/opt/mise/$kind" ] || continue
+  mkdir -p "$dir" 2>/dev/null || continue
+  [ -O "$dir" ] || continue
+  export "$var=$dir"
+done
+EOF
+RUN chmod 0644 /opt/wrap/bin/wrap-mise-env \
+ && printf '%s\n' '[ -r /opt/wrap/bin/wrap-mise-env ] && . /opt/wrap/bin/wrap-mise-env' \
+      >> /etc/profile.d/wrap.sh
+
+# `sudo -E` would carry the user's MISE_CACHE_DIR/MISE_STATE_DIR into a root
+# shell, and root's mise would then leave root-owned locks and a root-owned
+# trust state in the user's directory: the user's next install fails on files it
+# may not write. sudo drops both for every command here. An explicit
+# `sudo --preserve-env=MISE_STATE_DIR …` still hands one over — that is sudo's
+# own escape hatch, and it cannot be closed from sudoers without turning
+# preservation off everywhere.
+RUN cat > /etc/sudoers.d/20-wrap-mise <<'EOF'
+Defaults env_delete += "MISE_CACHE_DIR MISE_STATE_DIR"
+EOF
+RUN chmod 0440 /etc/sudoers.d/20-wrap-mise \
+ && visudo -cf /etc/sudoers.d/20-wrap-mise
+
 # Both agent CLIs are in the image and need no download on first use:
 #
 #  - agent-browser through mise's native registry backend (no npm, no Node in
@@ -83,29 +136,6 @@ RUN install -d /etc/dconf/profile \
 # with "failed to resolve configured install dependency 'node@latest'").
 COPY --chown=${WRAP_UID}:${WRAP_GID} resources/mise-desktop.toml /opt/mise/config/conf.d/desktop.toml
 RUN sudo -u "${WRAP_USER_NAME}" -H sh -lc 'mise install node agent-browser npm:agent-desktop'
-
-# mise's installs are shared by every bot HOME (MISE_DATA_DIR), but its cache,
-# state and locks default to $HOME. So four bots launching a tool with an update
-# pending take four different locks and race over the one shared install —
-# measured on this image: 3 of 4 launches died with "No executable found for
-# configured tool: agent-desktop" while another process replaced it. One
-# directory per uid, created on demand under a sticky parent, gives every
-# process of a uid the same lock domain wherever HOME points, and keeps root in
-# its own: the base image's per-uid defaults exist so a sudo shell cannot poison
-# the user's install state, and this keeps that true.
-RUN install -d -m 1777 /opt/mise/cache /opt/mise/state \
- && cat > /etc/profile.d/wrap-mise.sh <<'EOF'
-# mise: one cache and state directory per uid, independent of HOME. The server
-# in the machine starts from a login shell (`sh -lc`), so a bot's commands
-# inherit these and share the uid's install lock instead of racing each other.
-uid="$(id -u)"
-if [ -d /opt/mise/cache ] && mkdir -p "/opt/mise/cache/$uid" 2>/dev/null; then
-  MISE_CACHE_DIR="/opt/mise/cache/$uid"; export MISE_CACHE_DIR
-fi
-if [ -d /opt/mise/state ] && mkdir -p "/opt/mise/state/$uid" 2>/dev/null; then
-  MISE_STATE_DIR="/opt/mise/state/$uid"; export MISE_STATE_DIR
-fi
-EOF
 
 # websockify bridges noVNC to x11vnc on every desktop start, so it is baked in.
 # It is AUR-only on Arch: a venv on the system python, which costs ~1MB where
@@ -467,7 +497,8 @@ RUN for home in /root /home/user; do \
 #
 #   wrap-a11y enable [--quiet]  switch it on if it is off; safe to repeat
 #   wrap-a11y status            print the state, exit 0 when it is on
-#   wrap-a11y watch             switch it back on when a launcher appears
+#   wrap-a11y watch             keep it on: re-enable when a launcher appears
+#                               or when the bus reports IsEnabled false itself
 #
 # Every wait is bounded (a condition with a deadline, never a forever poll).
 # ---------------------------------------------------------------------------
@@ -582,7 +613,7 @@ case "$cmd" in
   watch)  watch ;;
   status)
     if is_enabled; then say "accessibility on"; else say "accessibility off"; exit 1; fi ;;
-  *) echo "usage: wrap-a11y enable [--quiet] | status | watch" >&2; exit 2 ;;
+  *) echo "usage: wrap-a11y enable [--quiet] | status | watch | (watch: re-enables on a new launcher or an IsEnabled false report)" >&2; exit 2 ;;
 esac
 EOF
 RUN chmod 0755 /opt/wrap/bin/wrap-a11y
@@ -629,6 +660,9 @@ log="$run_dir/desktop.log"
 # login shells by /etc/profile.d/wrap-desktop.sh so later GUI launches join it.
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-$run_dir/runtime}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=$XDG_RUNTIME_DIR/bus}"
+# The desktop's children (XFCE, terminals, Chrome) are not login shells, so they
+# get the uid's mise cache/state here rather than from /etc/profile.d.
+[ -r /opt/wrap/bin/wrap-mise-env ] && . /opt/wrap/bin/wrap-mise-env
 quiet=0
 
 say() { [ "$quiet" = 1 ] || printf '%s\n' "$*" >&2; }

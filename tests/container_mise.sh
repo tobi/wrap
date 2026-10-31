@@ -66,12 +66,35 @@ else
     /opt/mise/cache/*) ;;
     *) echo 'cache dir is not pinned' >&2; exit 1 ;;
   esac
+  # Not a login shell either: a non-interactive zsh reads /etc/zsh/zshenv,
+  # which sources the same wrap.sh, so the desktop and a plain `zsh -c` land in
+  # the same lock domain.
+  test "$(HOME=/tmp/mise-home-a zsh -c 'echo "$MISE_STATE_DIR"' 2>/dev/null)" = "$state_a"
   ok 'mise cache and state are pinned per uid, whatever HOME points at'
 
-  # Four bot HOMEs launching the same tool at once (this container has the
-  # network, so a pending update is fetched): before the pinning, 3 of 4 died
-  # with "No executable found for configured tool" while one replaced the
-  # install. All four have to work.
+  # `sudo -E` must not hand the user's mise directories to a root shell: root's
+  # mise would leave root-owned locks and trust state in a directory the user
+  # then cannot update. (An explicit --preserve-env still passes one through;
+  # that is sudo's own escape hatch and is noted, not claimed away.)
+  sudo_state="$(MISE_STATE_DIR="/opt/mise/state/$(id -u)" MISE_CACHE_DIR="/opt/mise/cache/$(id -u)" \
+    sudo -n -E sh -c 'echo "$MISE_STATE_DIR|$MISE_CACHE_DIR"')"
+  test "$sudo_state" = '|'
+  ok 'sudo -E does not carry the mise cache and state into a root shell'
+
+  # Four bot HOMEs launching the same tool while an update is pending. That
+  # pending update is made here instead of waited for: install the release
+  # before the current one, then remove the current one, so mise's `latest`
+  # still resolves to it and every launch has to fetch it. Before the pinning
+  # this raced — one bot executed a binary another was replacing (node parsed
+  # an ELF: SyntaxError), or died with "No executable found for configured
+  # tool"; all four have to work now.
+  current="$(mise ls npm:agent-desktop | awk '/latest/ {print $2; exit}')"
+  older="$(mise ls-remote npm:agent-desktop 2>/dev/null | sort -V | grep -vx "$current" | tail -1)"
+  test -n "$current"
+  test -n "$older"
+  mise install "npm:agent-desktop@$older" >/dev/null
+  mise uninstall "npm:agent-desktop@$current" >/dev/null
+  test "$(mise ls npm:agent-desktop | awk '/latest/ {print $2; exit}')" = "$older"
   for i in 1 2 3 4; do
     install -d "/tmp/mise-home-$i"
     ( HOME="/tmp/mise-home-$i" sh -lc 'agent-desktop version' \
@@ -81,12 +104,14 @@ else
   for i in 1 2 3 4; do
     if [ "$(cat "/tmp/mise-race-$i.rc")" != 0 ]; then
       printf 'bot home %s failed (rc %s):\n' "$i" "$(cat "/tmp/mise-race-$i.rc")" >&2
-      cat "/tmp/mise-race-$i.err" >&2
+      tail -20 "/tmp/mise-race-$i.err" >&2
       exit 1
     fi
   done
   updates="$(cat /tmp/mise-race-*.err | grep -c 'installed 1 tool' || true)"
-  ok "four bot HOMEs launch one tool at once ($updates of them installed an update)"
+  test "$updates" -ge 1
+  test "$(mise ls npm:agent-desktop | awk '/latest/ {print $2; exit}')" = "$current"
+  ok "four bot HOMEs updated one tool at once ($updates of them installed it)"
 
   MISE_OFFLINE=1 websockify --help >/dev/null
   ok 'websockify is ready offline'

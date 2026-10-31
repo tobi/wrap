@@ -215,10 +215,10 @@ ok "both agent CLIs work with a bot's own HOME"
 
 # --- a launcher that dies mid-session comes back ---------------------------
 # Killing the launcher also leaves its at-spi2-registryd behind: it is
-# reparented to pid 1 and stays attached to the bus that just went away, while
-# the launcher that comes back starts a fresh one (checked: 126 orphaned, 3480
-# new). It does no harm, and it is not this script's process to end, so nothing
-# here cleans it up.
+# reparented to pid 1, still attached to the bus that just went away, and stays
+# for the life of the machine, while the launcher that comes back starts a fresh
+# one (checked: 126 orphaned, 3480 new). Nothing here ends it — it is not this
+# script's process, and ending it is not what the machine needs to recover.
 launcher_pid() { ps -eo pid,args | awk '/at-spi-bus-launcher/ && !/awk/ {print $1; exit}'; }
 before="$(launcher_pid)"
 [ -n "$before" ] || die 'no accessibility bus launcher before the restart'
@@ -257,9 +257,10 @@ chrome_pid() { ps -eo pid,args | awk '/opt\/google\/chrome\/chrome --disable-dev
 dead_chrome="$(chrome_pid)"
 [ -n "$dead_chrome" ] || die 'no Chrome browser process before the restart'
 kill "$dead_chrome"
-for i in $(seq 60); do curl -fsS -m 1 http://127.0.0.1:9222/json/version >/dev/null 2>&1 || break; sleep 1; done
+chrome_up() { curl -fsS -m 1 http://127.0.0.1:9222/json/version >/dev/null 2>&1; }
+for i in $(seq 60); do chrome_up || break; sleep 1; done
 wrap-desktop start --quiet || die 'wrap-desktop start failed after the Chrome restart'
-wait_until 90 'CDP after the Chrome restart' curl -fsS -m 1 http://127.0.0.1:9222/json/version
+wait_until 90 'CDP after the Chrome restart' chrome_up
 wrap-chrome http://127.0.0.1:8799/index.html >/dev/null 2>&1 || true
 wait_until 90 "Chrome's page on the tree after the restart" chrome_page
 windows="$(agent-desktop list-windows 2>/dev/null | tr '{' '\n' | grep -c '"app_name":"chrome"')"
@@ -278,10 +279,20 @@ bus_after="$(xprop -root AT_SPI_BUS 2>/dev/null)"
 [ "$bus_before" = "$bus_after" ] \
   || die "root's login shell changed AT_SPI_BUS: $bus_before -> $bus_after"
 case "$bus_after" in
-  *"$(id -u)"*) ;;
-  *) die "AT_SPI_BUS no longer points at this uid's runtime: $bus_after" ;;
+  *"wrap-desktop-$(id -u)/"*) ;;
+  *) die "AT_SPI_BUS no longer points at this uid's desktop: $bus_after" ;;
 esac
 ok 'a sudo login shell leaves the accessibility bus alone'
+
+# The desktop's own processes have no login shell behind them: wrap-desktop
+# sources the mise pin itself, or XFCE, a terminal and Chrome would each fall
+# back to a per-HOME cache and take a second lock domain.
+desktop_child=$(ps -eo pid,args | awk '/xfdesktop/ && !/awk/ {print $1; exit}')
+[ -n "$desktop_child" ] || die 'no xfdesktop process to inspect'
+child_state=$(tr '\0' '\n' < "/proc/$desktop_child/environ" | sed -n 's/^MISE_STATE_DIR=//p')
+[ "$child_state" = "/opt/mise/state/$(id -u)" ] \
+  || die "a desktop process has MISE_STATE_DIR='$child_state'"
+ok "the desktop's own processes use this uid's mise state"
 
 kill "$greet_pid" 2>/dev/null || true
 start_greet
