@@ -214,6 +214,11 @@ HOME="$bot_home" agent-browser --version >/dev/null \
 ok "both agent CLIs work with a bot's own HOME"
 
 # --- a launcher that dies mid-session comes back ---------------------------
+# Killing the launcher also leaves its at-spi2-registryd behind: it is
+# reparented to pid 1 and stays attached to the bus that just went away, while
+# the launcher that comes back starts a fresh one (checked: 126 orphaned, 3480
+# new). It does no harm, and it is not this script's process to end, so nothing
+# here cleans it up.
 launcher_pid() { ps -eo pid,args | awk '/at-spi-bus-launcher/ && !/awk/ {print $1; exit}'; }
 before="$(launcher_pid)"
 [ -n "$before" ] || die 'no accessibility bus launcher before the restart'
