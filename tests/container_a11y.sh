@@ -170,7 +170,7 @@ cat > "$work/page/index.html" <<'EOF'
 EOF
 (cd "$work/page" && exec /usr/bin/python -m http.server 8799 --bind 127.0.0.1 >/dev/null 2>&1) &
 pids+=($!)
-page_up() { curl -fsS -o /dev/null http://127.0.0.1:8799/index.html; }
+page_up() { curl -fsS -o /dev/null http://127.0.0.1:8799/index.html 2>/dev/null; }
 wait_until 20 'the local page' page_up
 
 # The shared desktop Chrome: a URL handed to the running instance opens a
@@ -231,3 +231,55 @@ start_greet
 readable() { agent-desktop snapshot --app greet -i 2>/dev/null | grep -q '"role":"textfield"'; }
 wait_until 60 'an app started after the restart to be readable' readable
 ok 'an app started after the restart is readable again'
+
+# --- accessibility goes off by itself; only the bus event can bring it back --
+# The launcher clears IsEnabled when the last client holding an AT-SPI event
+# listener disconnects, and says so with PropertiesChanged — no name change.
+# The supervisor's 30s re-check is off for this container (asserted below), so
+# nothing but the watcher's event handling can switch it on again.
+[ "${WRAP_DESKTOP_SUPERVISE_SECONDS:-}" = 0 ] \
+  || die 'run this with WRAP_DESKTOP_SUPERVISE_SECONDS=0 (container_a11y_run.sh does)'
+gdbus call --session -d org.a11y.Bus -o /org/a11y/bus \
+  -m org.freedesktop.DBus.Properties.Set org.a11y.Status IsEnabled '<false>' >/dev/null \
+  || die 'could not switch IsEnabled off'
+wait_until 30 'the watcher to switch accessibility back on' a11y_on
+ok 'accessibility comes back after the bus switches itself off (event only)'
+
+# --- Chrome that is restarted mid-session is readable, once -----------------
+# Chrome decides at start whether to publish, so a restarted browser has to end
+# up on the tree again, with exactly one window to resolve.
+chrome_pid() { ps -eo pid,args | awk '/opt\/google\/chrome\/chrome --disable-dev-shm/ && !/awk/ {print $1; exit}'; }
+dead_chrome="$(chrome_pid)"
+[ -n "$dead_chrome" ] || die 'no Chrome browser process before the restart'
+kill "$dead_chrome"
+for i in $(seq 60); do curl -fsS -m 1 http://127.0.0.1:9222/json/version >/dev/null 2>&1 || break; sleep 1; done
+wrap-desktop start --quiet || die 'wrap-desktop start failed after the Chrome restart'
+wait_until 90 'CDP after the Chrome restart' curl -fsS -m 1 http://127.0.0.1:9222/json/version
+wrap-chrome http://127.0.0.1:8799/index.html >/dev/null 2>&1 || true
+wait_until 90 "Chrome's page on the tree after the restart" chrome_page
+windows="$(agent-desktop list-windows 2>/dev/null | tr '{' '\n' | grep -c '"app_name":"chrome"')"
+[ "$windows" = 1 ] || die "expected one Chrome window after the restart, found $windows"
+agent-desktop snapshot --app chrome -i 2>/dev/null | grep -q 'Press me' \
+  || die 'Chrome is not readable after the restart'
+ok 'Chrome restarted mid-session is on the tree again, with one window'
+
+# --- root's login shell must not take the bus over --------------------------
+# `sudo -i` runs the image's login profile, which runs `wrap-desktop start` as
+# root. A root launcher would publish its own address on the shared root window
+# and the user's apps would try to reach a bus they cannot connect to.
+bus_before="$(xprop -root AT_SPI_BUS 2>/dev/null)"
+sudo -n -i true || die 'sudo -n -i true failed'
+bus_after="$(xprop -root AT_SPI_BUS 2>/dev/null)"
+[ "$bus_before" = "$bus_after" ] \
+  || die "root's login shell changed AT_SPI_BUS: $bus_before -> $bus_after"
+case "$bus_after" in
+  *"$(id -u)"*) ;;
+  *) die "AT_SPI_BUS no longer points at this uid's runtime: $bus_after" ;;
+esac
+ok 'a sudo login shell leaves the accessibility bus alone'
+
+kill "$greet_pid" 2>/dev/null || true
+start_greet
+visible() { agent-desktop snapshot --app greet -i 2>/dev/null | grep -q '"role":"textfield"'; }
+wait_until 60 'a fresh app to be visible after the sudo login' visible
+ok 'a fresh app is still visible after a sudo login'

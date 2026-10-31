@@ -485,7 +485,21 @@ wait_for() { # tries command...
   done
 }
 
+# The desktop belongs to the uid that started its Xvfb. Only that uid may switch
+# the bus on: the launcher publishes its address on the shared root window, so a
+# second uid (a `sudo -i` login shell runs `wrap-desktop start` too) would start
+# a launcher of its own and point every app — the user's included — at a bus
+# under /tmp/wrap-desktop-0 that they cannot connect to.
+owns_desktop() {
+  pidfile="/tmp/wrap-desktop-$(id -u)/xvfb.pid"
+  [ -f "$pidfile" ] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null
+}
+
 enable() {
+  if ! owns_desktop; then
+    say "wrap-a11y: the desktop is not this uid's; leaving accessibility to its owner"
+    return 0
+  fi
   if ! wait_for 100 bus_up; then
     say "wrap-a11y: no session bus at $DBUS_SESSION_BUS_ADDRESS"
     return 1
@@ -512,18 +526,28 @@ enable() {
   say "accessibility on"
 }
 
-# Event-driven recovery: gdbus prints one line per ownership change of
-# org.a11y.Bus — "is owned by :1.7" or "does not have an owner" — and nothing
-# else we act on, so a launcher that dies (or one that exits when the last app
-# disconnects) gets a launcher started again, switched on, at once. When the
-# session bus goes away the monitor ends; `wrap-desktop run` starts this piece
-# again, and `start` switches accessibility on there too.
+# Event-driven recovery, on the bus's own signals: gdbus prints one line per
+# event, so nothing has to be parsed. Two of them matter:
+#
+#   "The name org.a11y.Bus is owned by :1.7" / "does not have an owner"
+#       — a launcher appeared (a fresh one starts switched off) or went away.
+#   "/org/a11y/bus: …PropertiesChanged ('org.a11y.Status', {'IsEnabled': <false>}, @as [])"
+#       — the launcher switched itself off, which it does when the last client
+#       that held an AT-SPI event listener disconnects (at-spi-bus-launcher.c,
+#       event_listener_vanished_callback). No name change is involved, so this
+#       is the only event that says accessibility just went off.
+#
+# Only a false value is acted on; our own write reports <true>, so this cannot
+# loop. When the session bus goes away the monitor ends; `wrap-desktop run`
+# starts this piece again and `start` switches accessibility on there too.
 watch() {
   enable || true
+  owns_desktop || return 0
   gdbus monitor --session --dest org.a11y.Bus 2>/dev/null |
   while read -r line; do
     case "$line" in
       *'name org.a11y.Bus'*) enable || true ;;
+      *PropertiesChanged*"'IsEnabled': <false>"*) enable || true ;;
     esac
   done
 }
@@ -589,6 +613,8 @@ say() { [ "$quiet" = 1 ] || printf '%s\n' "$*" >&2; }
 display_up() { xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; }
 bus_up() { dbus-send --session --dest=org.freedesktop.DBus --type=method_call \
   /org/freedesktop/DBus org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1; }
+# This uid's desktop is the one whose Xvfb it started (same rule as wrap-a11y).
+owns_desktop() { [ -f "$run_dir/xvfb.pid" ] && kill -0 "$(cat "$run_dir/xvfb.pid" 2>/dev/null)" 2>/dev/null; }
 
 # Chrome trusts NSS (~/.pki/nssdb), not the system CA store. Import every local
 # CA anchor so TLS-intercepting sandboxes (microsandbox secret injection puts
@@ -645,13 +671,18 @@ start() {
     xset -display "$DISPLAY" s off -dpms >/dev/null 2>&1 || true
     fresh_desktop=1
   fi
-  # Accessibility after X and before anything with a toolkit starts. Both
-  # halves matter: an app that starts while the bus is off never registers, and
-  # the bus launcher can only publish AT_SPI_BUS on the root window once X
-  # answers — Chromium finds the accessibility bus through that property. The
-  # calls are idempotent and cheap, so every `start` re-checks them.
-  wrap-a11y enable --quiet || say "accessibility did not switch on (see $log)"
-  spawn a11y wrap-a11y watch
+  # Accessibility, after X is up: the bus launcher publishes AT_SPI_BUS on the
+  # root window, which is how Chromium finds the bus, so it cannot run before
+  # the display answers. Only the uid that owns this desktop switches it on —
+  # a `sudo -i` login shell runs `start` too, and a launcher of its own would
+  # take the root window's address over with a bus the user cannot connect to.
+  # Both calls are idempotent and cheap, so every `start` re-checks them.
+  if owns_desktop; then
+    wrap-a11y enable --quiet || say "accessibility did not switch on (see $log)"
+    spawn a11y wrap-a11y watch
+  else
+    say "desktop belongs to another uid; leaving accessibility to its owner"
+  fi
   if [ "$fresh_desktop" = 1 ]; then
     # startxfce4 with DISPLAY and DBUS_SESSION_BUS_ADDRESS set runs xinitrc
     # directly (xfwm4, xfdesktop, panel) instead of launching its own X/dbus.
