@@ -84,6 +84,29 @@ RUN install -d /etc/dconf/profile \
 COPY --chown=${WRAP_UID}:${WRAP_GID} resources/mise-desktop.toml /opt/mise/config/conf.d/desktop.toml
 RUN sudo -u "${WRAP_USER_NAME}" -H sh -lc 'mise install node agent-browser npm:agent-desktop'
 
+# mise's installs are shared by every bot HOME (MISE_DATA_DIR), but its cache,
+# state and locks default to $HOME. So four bots launching a tool with an update
+# pending take four different locks and race over the one shared install —
+# measured on this image: 3 of 4 launches died with "No executable found for
+# configured tool: agent-desktop" while another process replaced it. One
+# directory per uid, created on demand under a sticky parent, gives every
+# process of a uid the same lock domain wherever HOME points, and keeps root in
+# its own: the base image's per-uid defaults exist so a sudo shell cannot poison
+# the user's install state, and this keeps that true.
+RUN install -d -m 1777 /opt/mise/cache /opt/mise/state \
+ && cat > /etc/profile.d/wrap-mise.sh <<'EOF'
+# mise: one cache and state directory per uid, independent of HOME. The server
+# in the machine starts from a login shell (`sh -lc`), so a bot's commands
+# inherit these and share the uid's install lock instead of racing each other.
+uid="$(id -u)"
+if [ -d /opt/mise/cache ] && mkdir -p "/opt/mise/cache/$uid" 2>/dev/null; then
+  MISE_CACHE_DIR="/opt/mise/cache/$uid"; export MISE_CACHE_DIR
+fi
+if [ -d /opt/mise/state ] && mkdir -p "/opt/mise/state/$uid" 2>/dev/null; then
+  MISE_STATE_DIR="/opt/mise/state/$uid"; export MISE_STATE_DIR
+fi
+EOF
+
 # websockify bridges noVNC to x11vnc on every desktop start, so it is baked in.
 # It is AUR-only on Arch: a venv on the system python, which costs ~1MB where
 # mise's own python + uv cost ~240MB. --no-deps skips numpy (it only speeds up

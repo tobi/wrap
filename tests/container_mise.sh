@@ -50,6 +50,44 @@ else
   test -x "$package_bin/agent-desktop-linux-clipboard-owner"
   ok 'agent-desktop’s postinstall linked the native binary and its clipboard helper'
 
+  # mise keeps installs in /opt/mise/data, shared by every bot HOME, but its
+  # cache, state and locks are pinned per uid by /etc/profile.d/wrap-mise.sh:
+  # otherwise four bots launching a tool with an update pending each take their
+  # own lock and race over the one shared install. A bot command's environment
+  # comes from a login shell (`rune serve` starts from `sh -lc`), so that is
+  # what these two HOMEs go through.
+  state_a="$(HOME=/tmp/mise-home-a sh -lc 'echo "$MISE_STATE_DIR"' 2>/dev/null)"
+  state_b="$(HOME=/tmp/mise-home-b sh -lc 'echo "$MISE_STATE_DIR"' 2>/dev/null)"
+  test -n "$state_a"
+  test "$state_a" = "$state_b"
+  test -d "$state_a"
+  case "$state_a" in /opt/mise/state/"$(id -u)") ;; *) echo "state dir is $state_a" >&2; exit 1 ;; esac
+  case "$(HOME=/tmp/mise-home-a sh -lc 'echo "$MISE_CACHE_DIR"' 2>/dev/null)" in
+    /opt/mise/cache/*) ;;
+    *) echo 'cache dir is not pinned' >&2; exit 1 ;;
+  esac
+  ok 'mise cache and state are pinned per uid, whatever HOME points at'
+
+  # Four bot HOMEs launching the same tool at once (this container has the
+  # network, so a pending update is fetched): before the pinning, 3 of 4 died
+  # with "No executable found for configured tool" while one replaced the
+  # install. All four have to work.
+  for i in 1 2 3 4; do
+    install -d "/tmp/mise-home-$i"
+    ( HOME="/tmp/mise-home-$i" sh -lc 'agent-desktop version' \
+        >"/tmp/mise-race-$i.out" 2>"/tmp/mise-race-$i.err"; echo $? >"/tmp/mise-race-$i.rc" ) &
+  done
+  wait
+  for i in 1 2 3 4; do
+    if [ "$(cat "/tmp/mise-race-$i.rc")" != 0 ]; then
+      printf 'bot home %s failed (rc %s):\n' "$i" "$(cat "/tmp/mise-race-$i.rc")" >&2
+      cat "/tmp/mise-race-$i.err" >&2
+      exit 1
+    fi
+  done
+  updates="$(cat /tmp/mise-race-*.err | grep -c 'installed 1 tool' || true)"
+  ok "four bot HOMEs launch one tool at once ($updates of them installed an update)"
+
   MISE_OFFLINE=1 websockify --help >/dev/null
   ok 'websockify is ready offline'
 
