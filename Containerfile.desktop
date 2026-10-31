@@ -21,6 +21,12 @@ ENV HOME=/root USER=root
 
 # One shared X display for everything. agent-browser sees DISPLAY set and puts
 # Chrome on the XFCE desktop instead of spawning a private Xvfb.
+# NO_AT_BRIDGE must not be set: GTK reads it as "do not load the AT-SPI bridge",
+# which hides every app from agent-desktop. GNOME_ACCESSIBILITY=1 says the
+# session has accessibility on, which Chromium reads per process: with
+# --no-startup-window it otherwise never initialises its AT-SPI bridge (checked:
+# a window handed to it later does not change that). The bus itself is switched
+# on by wrap-a11y (see the wrap-desktop section below).
 ENV DISPLAY=:1 \
     WRAP_DESKTOP_GEOMETRY=1280x800x24 \
     WRAP_DESKTOP_VNC_PORT=5900 \
@@ -28,7 +34,7 @@ ENV DISPLAY=:1 \
     WRAP_DESKTOP_CDP_PORT=9222 \
     WRAP_DESKTOP_CDP_PUBLIC_PORT=9223 \
     XDG_SESSION_TYPE=x11 \
-    NO_AT_BRIDGE=1
+    GNOME_ACCESSIBILITY=1
 
 # ---------------------------------------------------------------------------
 # X + XFCE + VNC + Chrome runtime deps (Arch repos). XFCE is assembled from
@@ -47,10 +53,36 @@ RUN pacman -Syu --noconfirm --needed \
  && dbus-uuidgen --ensure=/etc/machine-id \
  && rm -rf /var/cache/pacman/pkg/*
 
-# agent-browser installs on demand through mise's native registry backend,
-# without npm/Node or a custom launcher.
+# dconf profile. The a11y state at-spi keeps (org.a11y.Status IsEnabled, which
+# it mirrors into gsettings' toolkit-accessibility) is written through dconf's
+# user database. Arch ships no /etc/dconf/profile, so dconf falls back to its
+# built-in default; naming it here makes the database layout explicit the way
+# other distributions do. It is not a fix: this image's dconf reads and writes
+# the same key without the file (checked), so do not read it as the reason
+# accessibility used to stay off — that was NO_AT_BRIDGE and IsEnabled below.
+RUN install -d /etc/dconf/profile \
+ && printf '%s\n' 'user-db:user' > /etc/dconf/profile/user
+
+# Both agent CLIs are in the image and need no download on first use:
+#
+#  - agent-browser through mise's native registry backend (no npm, no Node in
+#    its call path, no custom launcher).
+#  - agent-desktop through mise's npm backend. The npm package ships the native
+#    binaries; its postinstall is what copies the platform binary over the Node
+#    launcher and puts agent-desktop-linux-clipboard-owner beside it. npm runs
+#    no package scripts by default, and mise's embedded aube follows it, so the
+#    declaration approves exactly that one package (allow_builds) — nothing
+#    else runs, and npm's --ignore-scripts is not turned off globally.
+#    Running the postinstall needs node, which mise installs as a dependency.
+#
+# Updates stay with mise: the base config sets tool_update.global_auto, so an
+# installed tool is refreshed before it launches once mise's check interval has
+# passed. `mise install` here names its tools on purpose: a bare `mise install`
+# would also pull every lazy runtime in the base config, and node is named
+# because mise does not fetch a lazy node for an npm tool by itself (it fails
+# with "failed to resolve configured install dependency 'node@latest'").
 COPY --chown=${WRAP_UID}:${WRAP_GID} resources/mise-desktop.toml /opt/mise/config/conf.d/desktop.toml
-RUN sudo -u "${WRAP_USER_NAME}" -H sh -lc 'mise reshim'
+RUN sudo -u "${WRAP_USER_NAME}" -H sh -lc 'mise install node agent-browser npm:agent-desktop'
 
 # websockify bridges noVNC to x11vnc on every desktop start, so it is baked in.
 # It is AUR-only on Arch: a venv on the system python, which costs ~1MB where
@@ -207,8 +239,12 @@ fi
 # Rotate the caller's arguments (URLs) back behind the configured flags.
 while [ "$n" -gt 0 ]; do a=$1; shift; set -- "$@" "$a"; n=$((n - 1)); done
 # --password-store=basic: never trigger a keyring unlock dialog.
+# --force-renderer-accessibility: publish the web contents on the AT-SPI tree.
+# Chromium leaves renderer accessibility off until an assistive technology is
+# detected, which on this image nothing does; agent-desktop reads desktop apps
+# through that tree (wrap-a11y switches the bus on).
 set -- --disable-dev-shm-usage --no-first-run --no-default-browser-check \
-       --password-store=basic "$@"
+       --password-store=basic --force-renderer-accessibility "$@"
 if [ "$(id -u)" = 0 ]; then
   set -- --no-sandbox "$@"
 fi
@@ -374,11 +410,135 @@ RUN cat > /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-desktop.xml <
   </property>
 </channel>
 EOF
+# Compositing off. With xfwm4's compositor running, the X root window holds only
+# the compositor's own stage, not the app windows, so a whole-screen capture
+# cannot see what is on screen; agent-desktop refuses it outright
+# (`screenshot --screen 0` -> PLATFORM_NOT_SUPPORTED, reason compositing).
+# Without a compositor the root window holds the windows themselves and the
+# capture is truthful. Nothing in this desktop needs the compositor: no
+# transparency, no shadows, no window previews.
+RUN cat > /etc/skel/.config/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<channel name="xfwm4" version="1.0">
+  <property name="general" type="empty">
+    <property name="use_compositing" type="bool" value="false"/>
+  </property>
+</channel>
+EOF
 RUN for home in /root /home/user; do \
       install -d "$home/.config"; \
       cp -a /etc/skel/.config/xfce4 "$home/.config/"; \
     done \
  && chown -R "${WRAP_UID}:${WRAP_GID}" /home/user/.config
+
+# ---------------------------------------------------------------------------
+# wrap-a11y: switch the AT-SPI accessibility bus on for this session.
+#
+# agent-desktop reads desktop apps through AT-SPI, and a toolkit publishes its
+# tree only while org.a11y.Status.IsEnabled is true on the session bus. at-spi's
+# bus launcher keeps that flag in memory (bus/at-spi-bus-launcher.c: it is
+# zero-initialised, written to gsettings' toolkit-accessibility in
+# handle_a11y_enabled_change and cleared when no app holds an event listener),
+# so it is an input that must be set after every launcher start — `gsettings set
+# org.gnome.desktop.interface toolkit-accessibility true` alone does nothing.
+#
+#   wrap-a11y enable [--quiet]  switch it on if it is off; safe to repeat
+#   wrap-a11y status            print the state, exit 0 when it is on
+#   wrap-a11y watch             switch it back on when a launcher appears
+#
+# Every wait is bounded (a condition with a deadline, never a forever poll).
+# ---------------------------------------------------------------------------
+RUN cat > /opt/wrap/bin/wrap-a11y <<'EOF'
+#!/bin/sh
+set -eu
+: "${XDG_RUNTIME_DIR:=/tmp/wrap-desktop-$(id -u)/runtime}"
+: "${DBUS_SESSION_BUS_ADDRESS:=unix:path=$XDG_RUNTIME_DIR/bus}"
+export XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+quiet=0
+say() { [ "$quiet" = 1 ] || printf '%s\n' "$*" >&2; }
+
+bus_up() {
+  dbus-send --session --dest=org.freedesktop.DBus --type=method_call \
+    /org/freedesktop/DBus org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1
+}
+
+# The property, not gsettings: the launcher writes gsettings from it.
+is_enabled() {
+  gdbus call --session -d org.a11y.Bus -o /org/a11y/bus \
+    -m org.freedesktop.DBus.Properties.Get org.a11y.Status IsEnabled 2>/dev/null \
+    | grep -q 'true'
+}
+
+# D-Bus activates the launcher and its private bus on first use, so this also
+# brings the a11y bus itself up when nothing has asked for it yet.
+launcher_up() {
+  gdbus call --session -d org.a11y.Bus -o /org/a11y/bus \
+    -m org.a11y.Bus.GetAddress >/dev/null 2>&1
+}
+
+wait_for() { # tries command...
+  tries=$1; shift
+  i=0
+  until "$@"; do
+    i=$((i + 1)); [ "$i" -lt "$tries" ] || return 1
+    sleep 0.1
+  done
+}
+
+enable() {
+  if ! wait_for 100 bus_up; then
+    say "wrap-a11y: no session bus at $DBUS_SESSION_BUS_ADDRESS"
+    return 1
+  fi
+  if ! launcher_up; then
+    say "wrap-a11y: org.a11y.Bus did not answer"
+    return 1
+  fi
+  # Already on: nothing to write (a repeat call costs two D-Bus calls).
+  if is_enabled; then
+    say "accessibility already on"
+    return 0
+  fi
+  if ! gdbus call --session -d org.a11y.Bus -o /org/a11y/bus \
+      -m org.freedesktop.DBus.Properties.Set \
+      org.a11y.Status IsEnabled '<true>' >/dev/null; then
+    say "wrap-a11y: setting org.a11y.Status IsEnabled failed"
+    return 1
+  fi
+  if ! wait_for 20 is_enabled; then
+    say "wrap-a11y: org.a11y.Status IsEnabled did not stay true"
+    return 1
+  fi
+  say "accessibility on"
+}
+
+# Event-driven recovery: gdbus prints one line per ownership change of
+# org.a11y.Bus — "is owned by :1.7" or "does not have an owner" — and nothing
+# else we act on, so a launcher that dies (or one that exits when the last app
+# disconnects) gets a launcher started again, switched on, at once. When the
+# session bus goes away the monitor ends; `wrap-desktop run` starts this piece
+# again, and `start` switches accessibility on there too.
+watch() {
+  enable || true
+  gdbus monitor --session --dest org.a11y.Bus 2>/dev/null |
+  while read -r line; do
+    case "$line" in
+      *'name org.a11y.Bus'*) enable || true ;;
+    esac
+  done
+}
+
+cmd="${1:-enable}"; [ $# -gt 0 ] && shift
+for a in "$@"; do [ "$a" = "--quiet" ] && quiet=1; done
+case "$cmd" in
+  enable) enable ;;
+  watch)  watch ;;
+  status)
+    if is_enabled; then say "accessibility on"; else say "accessibility off"; exit 1; fi ;;
+  *) echo "usage: wrap-a11y enable [--quiet] | status | watch" >&2; exit 2 ;;
+esac
+EOF
+RUN chmod 0755 /opt/wrap/bin/wrap-a11y
 
 # ---------------------------------------------------------------------------
 # wrap-desktop: idempotent supervisor for Xvfb :1 + XFCE + Chrome (CDP) +
@@ -394,6 +554,10 @@ RUN for home in /root /home/user; do \
 #   wrap-desktop stop              tear down what this uid started
 #   wrap-desktop run               start, supervise, block (container CMD)
 #   wrap-desktop url               print the noVNC URL
+#
+# Accessibility: `start` switches the AT-SPI bus on (wrap-a11y) before XFCE and
+# Chrome start, and supervises `wrap-a11y watch`, so agent-desktop can read the
+# desktop's apps and a bus launcher that dies mid-session comes back on its own.
 # ---------------------------------------------------------------------------
 RUN cat > /opt/wrap/bin/wrap-desktop <<'EOF'
 #!/bin/sh
@@ -466,6 +630,7 @@ start() {
     done
   fi
   trust_local_cas
+  fresh_desktop=0
   if display_up; then
     say "desktop already up on $DISPLAY"
   else
@@ -478,6 +643,16 @@ start() {
       sleep 0.1
     done
     xset -display "$DISPLAY" s off -dpms >/dev/null 2>&1 || true
+    fresh_desktop=1
+  fi
+  # Accessibility after X and before anything with a toolkit starts. Both
+  # halves matter: an app that starts while the bus is off never registers, and
+  # the bus launcher can only publish AT_SPI_BUS on the root window once X
+  # answers — Chromium finds the accessibility bus through that property. The
+  # calls are idempotent and cheap, so every `start` re-checks them.
+  wrap-a11y enable --quiet || say "accessibility did not switch on (see $log)"
+  spawn a11y wrap-a11y watch
+  if [ "$fresh_desktop" = 1 ]; then
     # startxfce4 with DISPLAY and DBUS_SESSION_BUS_ADDRESS set runs xinitrc
     # directly (xfwm4, xfdesktop, panel) instead of launching its own X/dbus.
     spawn xfce startxfce4
@@ -580,6 +755,26 @@ RUN cat > /etc/wrap/desktop.md <<'EOF'
   hand back). A project-level ./agent-browser.json still overrides, e.g. drop
   `cdp` to get an isolated headed Chrome instead. `agent-browser doctor` verifies.
   Pages' WebMCP tools: `agent-browser webmcp list` / `webmcp invoke <tool>`.
+- agent-desktop (installed too, no download on first use) sees and drives the
+  desktop's apps through AT-SPI: `agent-desktop list-apps`, `snapshot --app
+  <name> -i`, then `click`/`type` with the refs it printed. It needs the
+  accessibility bus on; `wrap-a11y status` says whether it is, and
+  `wrap-desktop start` switches it on (see below).
+- Accessibility: nothing here sets NO_AT_BRIDGE, which would keep GTK from
+  loading the bridge. The bus is switched on by setting
+  org.a11y.Status.IsEnabled after the session bus is up (`wrap-a11y enable`,
+  run by `wrap-desktop start` before XFCE and Chrome). gsettings'
+  toolkit-accessibility is an *output* of that property, so setting it alone
+  does nothing. `wrap-desktop run` also supervises `wrap-a11y watch`, which
+  re-enables the moment a new bus launcher appears, so a launcher that dies
+  mid-session recovers without a login. Chrome is told to publish its web
+  contents with --force-renderer-accessibility, and a page only appears on the
+  tree once a window is open (the dock's icon or `wrap-chrome URL`).
+- No window compositor: xfwm4 runs with use_compositing false, because under a
+  compositor the X root window holds only the compositor's stage, so a
+  whole-screen capture (`wrap-desktop screenshot FILE`, `agent-desktop
+  screenshot --screen 0`) cannot see the real windows. A window that is covered
+  therefore cannot be captured on its own; capture the screen instead.
 - View: VNC :5900 (no password) or noVNC http://<host>:6080/vnc.html through the
   VM's published ports (wrap: `network.ports: [6080]`; the host side is loopback).
 EOF

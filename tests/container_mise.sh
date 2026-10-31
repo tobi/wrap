@@ -13,10 +13,13 @@ done
 ! command -v rustc >/dev/null
 ok 'unprivileged user has lazy tool shims and automatic updates enabled'
 
-for tool in rust go bun node pnpm python uv; do
+for tool in rust go bun pnpm python uv; do
   test ! -d "$MISE_DATA_DIR/installs/$tool"
 done
+# The desktop image installs node on purpose: agent-desktop's postinstall runs
+# on it. Every other runtime stays uninstalled in both images.
 if [ "$mode" = base ]; then
+  test ! -d "$MISE_DATA_DIR/installs/node"
   MISE_NOT_FOUND_AUTO_INSTALL=0 node --version
   test -d "$MISE_DATA_DIR/installs/node"
   for tool in rust go bun pnpm python uv; do
@@ -29,12 +32,26 @@ if [ "$mode" = base ]; then
   sudo -n -i env MISE_OFFLINE=1 node --version
   ok 'installed tools work offline with a different HOME and under sudo'
 else
-  test ! -d "$MISE_DATA_DIR/installs/agent-browser"
+  # Both agent CLIs are installed into the image, so first use needs no
+  # download: MISE_OFFLINE=1 here is the assertion, not a convenience.
+  test -d "$MISE_DATA_DIR/installs/agent-browser"
   test -x "$MISE_DATA_DIR/shims/agent-browser"
-  agent-browser --version
-  test ! -d "$MISE_DATA_DIR/installs/node"
+  MISE_OFFLINE=1 agent-browser --version
+  test -x "$MISE_DATA_DIR/shims/agent-desktop"
+  MISE_OFFLINE=1 agent-desktop version >/dev/null
+  ok 'agent-browser and agent-desktop are installed and start offline'
+
+  # The declaration approves exactly one package's install script
+  # (allow_builds), and that script is what links the native agent-desktop over
+  # the Node launcher and puts the clipboard helper beside it. A Node script
+  # here means the approval never reached the installer.
+  package_bin="$MISE_DATA_DIR/installs/npm-agent-desktop/latest/node_modules/agent-desktop/bin"
+  file "$package_bin/agent-desktop" | grep -q 'ELF'
+  test -x "$package_bin/agent-desktop-linux-clipboard-owner"
+  ok 'agent-desktop’s postinstall linked the native binary and its clipboard helper'
+
   MISE_OFFLINE=1 websockify --help >/dev/null
-  ok 'native agent-browser installs without node; websockify is ready offline'
+  ok 'websockify is ready offline'
 
   MISE_OFFLINE=1 wrap-desktop start --quiet
   MISE_OFFLINE=1 agent-browser open about:blank
