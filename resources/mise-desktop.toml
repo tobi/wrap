@@ -1,3 +1,18 @@
 [tools]
-# The native registry backend needs neither npm nor a Node bootstrap.
-agent-browser = { version = "latest", lazy = true }
+# Both agent CLIs are installed into the image at build time (the desktop
+# Containerfile runs `mise install` for them), so a fresh machine uses them with
+# no download. They are not lazy on purpose: `lazy = true` would only create the
+# shims and fetch the tool on first use.
+#
+# agent-browser comes from the native registry backend, so neither npm nor node
+# is involved in its install or its call path.
+agent-browser = { version = "latest" }
+
+# agent-desktop comes from npm. The package ships the native binaries and its
+# postinstall is what links the platform one over the Node launcher (plus the
+# clipboard helper). npm runs no package script unless the package is approved,
+# and mise's embedded aube follows that rule, so `allow_builds` approves exactly
+# this one package: no other package's scripts run, and scripts stay off by
+# default everywhere else. The desktop Containerfile installs node beside it —
+# mise does not fetch a tool's lazy dependency by itself.
+"npm:agent-desktop" = { version = "latest", allow_builds = ["agent-desktop"] }

@@ -30,6 +30,11 @@ test-images: check-engine
 	$(CONTAINER_ENGINE) build -t localhost/wrap:desktop-test --build-arg BASE_IMAGE=localhost/wrap:test -f Containerfile.desktop .
 	$(CONTAINER_ENGINE) run --rm -v "$(CURDIR)/tests:/tests:ro" localhost/wrap:desktop-test bash /tests/container_mise.sh desktop
 	$(CONTAINER_ENGINE) run --rm --network none -e MISE_OFFLINE=1 localhost/wrap:desktop-test sh -ec 'wrap-desktop start --quiet; curl -fsS --retry 10 --retry-connrefused --retry-delay 1 http://127.0.0.1:6080/vnc.html >/dev/null; curl -fsS http://127.0.0.1:9222/json/version >/dev/null'
+# Both agent CLIs on a fresh bot HOME with no network and no MISE_OFFLINE: the
+# image's own install filled the uid's cache and state, so this is a plain first
+# call and must not download or stall.
+	$(CONTAINER_ENGINE) run --rm --network none localhost/wrap:desktop-test sh -lc 'd=$$(mktemp -d); HOME=$$d agent-browser --version >/dev/null && HOME=$$d agent-desktop version >/dev/null'
+	CONTAINER_ENGINE="$(CONTAINER_ENGINE)" bash tests/container_a11y_run.sh localhost/wrap:desktop-test
 	CONTAINER_ENGINE="$(CONTAINER_ENGINE)" bash tests/container_desktop_run.sh localhost/wrap:desktop-test
 
 fmt-check:
