@@ -348,13 +348,15 @@ EOF
 # that allows them (microVMs, `--security-opt seccomp=unconfined`).
 # Chrome honors only the last --enable-features: keep both WebMCP features in
 # any replacement line, or agent-browser's `webmcp` commands find no tools.
+# The page API is the WebMCP feature. Chrome 157 removed WebMCPTesting, which
+# 156 also took, so a line that names only that one leaves pages without it.
 RUN cat > /etc/wrap/chrome-flags.conf <<'EOF'
 # Extra Google Chrome flags, one per line. Copy to ~/.config/chrome-flags.conf
 # to change them; restart Chrome with `wrap-desktop stop && wrap-desktop start`.
 --no-sandbox
 # WebMCP: pages register tools on document.modelContext; agent-browser lists
 # and calls them with `agent-browser webmcp list|invoke`.
---enable-features=WebMCPTesting,DevToolsWebMCPSupport
+--enable-features=WebMCP,DevToolsWebMCPSupport
 EOF
 RUN chmod 0755 /usr/local/bin/google-chrome-stable \
  && ln -sf google-chrome-stable /usr/local/bin/google-chrome \
