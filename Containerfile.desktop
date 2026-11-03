@@ -1,18 +1,69 @@
 # wrap desktop: base image + a headless X desktop (Xvfb + XFCE), one persistent
 # Google Chrome on that desktop with CDP on localhost:9222 and every first-run/
 # setup prompt suppressed system-wide, and agent-browser preconfigured to attach
-# to that Chrome — so a human (via VNC) and the agent share the same browser.
+# to that Chrome — so a human (in the browser viewer) and the agent share the
+# same browser.
 #
 #   docker run -d ghcr.io/tobi/wrap:desktop              # desktop + chrome up
 #   docker run -it ghcr.io/tobi/wrap:desktop             # shell, desktop autostarts
 #   -e WRAP_DESKTOP_AUTOSTART=0                          # opt out of autostart
 #
-# VNC :5900 and noVNC :6080 listen on all guest interfaces so the VM/container
-# port publish (which targets the guest NIC, not its loopback) can reach them;
-# the host side of that publish is loopback-only. Chrome only binds CDP to
-# 127.0.0.1:9222 (it ignores --remote-debugging-address with a window), so a
-# socat forwarder serves it on all guest interfaces at :9223.
+# The viewer, voxl on :6080, listens on all guest interfaces so the VM/container
+# port publish (which targets the guest NIC, not its loopback) can reach it; the
+# host side of that publish is loopback-only, and voxl still asks for a password
+# and refuses other sites' pages. Chrome only binds CDP to 127.0.0.1:9222 (it
+# ignores --remote-debugging-address with a window), so a socat forwarder serves
+# it on all guest interfaces at :9223.
 ARG BASE_IMAGE=ghcr.io/tobi/wrap:latest
+
+# ---------------------------------------------------------------------------
+# voxl (github.com/tembo/voxl) is the viewer: it streams :1 to a browser as
+# H.264 over one WebSocket (WebCodecs decodes it) and sends input, clipboard
+# and file transfers back. It has no release binaries, so this stage builds a
+# pinned commit on the same base the image runs on; only the binary leaves it,
+# and the image installs the four libraries it links (x264, libyuv, opus,
+# libpulse). Everything else here — Rust, esbuild, the crates — stays behind.
+# ---------------------------------------------------------------------------
+FROM ${BASE_IMAGE} AS voxl
+# The base puts mise's shims first on PATH, and cargo there is a lazy install.
+# Arch's own rust is the toolchain here.
+ENV HOME=/root USER=root CARGO_HOME=/tmp/cargo PATH=/usr/bin:/bin
+RUN pacman -Syu --noconfirm --needed rust esbuild x264 libyuv opus libpulse \
+ && rm -rf /var/cache/pacman/pkg/*
+# Arch's libyuv ships no pkg-config file, and voxl's build.rs asks pkg-config
+# for every library it links.
+RUN install -d /opt/voxl/pkgconfig \
+ && cat > /opt/voxl/pkgconfig/libyuv.pc <<'EOF'
+prefix=/usr
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: libyuv
+Description: YUV conversion and scaling (Arch ships the library without this file)
+Version: 0
+Libs: -L${libdir} -lyuv
+Cflags: -I${includedir}
+EOF
+# main after v0.3.2: it also rebuilds the capture when the X screen changes size
+# (tembo/voxl#49) and no longer panics on a screen below 640x480 (#54).
+ARG VOXL_REV=f5d6ec93dd2745a680054071eae31aec45049a49
+RUN git init -q /src/voxl \
+ && git -C /src/voxl fetch -q --depth 1 https://github.com/tembo/voxl "${VOXL_REV}" \
+ && git -C /src/voxl checkout -q FETCH_HEAD \
+ && test "$(git -C /src/voxl rev-parse HEAD)" = "${VOXL_REV}"
+WORKDIR /src/voxl
+# bindgen 0.71 under Arch's libclang 23 emits x264_param_t as an opaque struct,
+# and encoder.rs then fails on every field it sets (E0609); 0.72.1 parses it.
+# Cargo.lock changes in bindgen's own version and checksum only, so the build
+# stays --locked to the rest of upstream's lockfile.
+RUN sed -i 's/^bindgen = "0.71"$/bindgen = "0.72"/' Cargo.toml \
+ && grep -qx 'bindgen = "0.72"' Cargo.toml \
+ && cargo update --quiet -p bindgen --precise 0.72.1 \
+ && PKG_CONFIG_PATH=/opt/voxl/pkgconfig cargo build --quiet --release --locked \
+ && install -D -m 0755 target/release/voxl /opt/voxl/bin/voxl \
+ && strip /opt/voxl/bin/voxl \
+ && /opt/voxl/bin/voxl --version
+
 FROM ${BASE_IMAGE}
 
 # Build steps run as root; keep root's droppings out of the user's home. The
@@ -29,21 +80,22 @@ ENV HOME=/root USER=root
 # on by wrap-a11y (see the wrap-desktop section below).
 ENV DISPLAY=:1 \
     WRAP_DESKTOP_GEOMETRY=1280x800x24 \
-    WRAP_DESKTOP_VNC_PORT=5900 \
-    WRAP_DESKTOP_NOVNC_PORT=6080 \
+    WRAP_DESKTOP_VIEWER_PORT=6080 \
     WRAP_DESKTOP_CDP_PORT=9222 \
     WRAP_DESKTOP_CDP_PUBLIC_PORT=9223 \
     XDG_SESSION_TYPE=x11 \
     GNOME_ACCESSIBILITY=1
 
 # ---------------------------------------------------------------------------
-# X + XFCE + VNC + Chrome runtime deps (Arch repos). XFCE is assembled from
+# X + XFCE + viewer + Chrome runtime deps (Arch repos). XFCE is assembled from
 # components rather than the `xfce4` group to skip power-manager, screensaver,
 # pulseaudio plugin and friends — nothing here should ever lock or dim :1.
+# x264, libyuv, opus and libpulse are what the voxl binary links (libpulse is
+# the client library only; no sound server runs, so voxl's audio is off).
 # ---------------------------------------------------------------------------
 RUN pacman -Syu --noconfirm --needed \
       xorg-server-xvfb xorg-xauth xorg-xdpyinfo xorg-xset xorg-xrandr xdotool \
-      x11vnc scrot socat \
+      scrot socat x264 libyuv opus libpulse \
       dbus xfce4-session xfwm4 xfdesktop xfce4-panel xfce4-settings xfconf \
       xfce4-terminal thunar xfce4-appfinder garcon adwaita-icon-theme \
       ttf-dejavu ttf-liberation noto-fonts noto-fonts-emoji \
@@ -137,25 +189,12 @@ RUN chmod 0440 /etc/sudoers.d/20-wrap-mise \
 COPY --chown=${WRAP_UID}:${WRAP_GID} resources/mise-desktop.toml /opt/mise/config/conf.d/desktop.toml
 RUN sudo -u "${WRAP_USER_NAME}" -H sh -lc 'mise install node agent-browser npm:agent-desktop'
 
-# websockify bridges noVNC to x11vnc on every desktop start, so it is baked in.
-# It is AUR-only on Arch: a venv on the system python, which costs ~1MB where
-# mise's own python + uv cost ~240MB. --no-deps skips numpy (it only speeds up
-# unmasking the small client-to-server frames) and the token-plugin libraries.
-RUN /usr/bin/python -m venv /opt/websockify \
- && /opt/websockify/bin/pip install --no-cache-dir --no-deps --quiet websockify \
- && /opt/websockify/bin/pip uninstall --yes --quiet pip \
- && ln -sf /opt/websockify/bin/websockify /usr/local/bin/websockify \
- && chmod -R a+rX /opt/websockify
-
-# noVNC is static files, not a CLI; keep its versioned distribution in the image.
-ARG NOVNC_VERSION=1.6.0
-RUN curl -fsSL "https://github.com/novnc/noVNC/archive/refs/tags/v${NOVNC_VERSION}.tar.gz" \
-      | bsdtar -x -C /tmp \
- && install -d /usr/share \
- && mv "/tmp/noVNC-${NOVNC_VERSION}" /usr/share/novnc \
- && rm -rf /usr/share/novnc/tests /usr/share/novnc/docs /usr/share/novnc/snap \
- && ln -sf vnc.html /usr/share/novnc/index.html \
- && chmod -R a+rX /usr/share/novnc
+# The viewer, from the voxl stage at the top. Its web client is compiled into
+# the binary, so it serves offline. LD_BIND_NOW makes the loader resolve every
+# symbol voxl uses before --version runs: a runtime library that drifted from
+# the one it was built against fails the build here, not a desktop start.
+COPY --from=voxl /opt/voxl/bin/voxl /usr/local/bin/voxl
+RUN LD_BIND_NOW=1 voxl --version
 
 # ---------------------------------------------------------------------------
 # Google Chrome stable, straight from Google's .deb (the AUR package does the
@@ -619,8 +658,8 @@ EOF
 RUN chmod 0755 /opt/wrap/bin/wrap-a11y
 
 # ---------------------------------------------------------------------------
-# wrap-desktop: idempotent supervisor for Xvfb :1 + XFCE + Chrome (CDP) +
-# x11vnc + noVNC. Runs as whoever calls it (normally `user`). Xvfb is started
+# wrap-desktop: idempotent supervisor for Xvfb :1 + XFCE + Chrome (CDP) + the
+# voxl viewer. Runs as whoever calls it (normally `user`). Xvfb is started
 # with -ac so any uid in the VM (sudo, root plumbing) can also draw on :1.
 # Each `start` re-spawns whichever piece has died, so a crashed Chrome comes
 # back on the next login shell; `run` also does that every
@@ -631,7 +670,8 @@ RUN chmod 0755 /opt/wrap/bin/wrap-a11y
 #   wrap-desktop status            exit 0 when :1 answers
 #   wrap-desktop stop              tear down what this uid started
 #   wrap-desktop run               start, supervise, block (container CMD)
-#   wrap-desktop url               print the noVNC URL
+#   wrap-desktop url [ADDRESS]     print the viewer's sign-in link
+#   wrap-desktop password          print the viewer's password
 #
 # Accessibility: `start` switches the AT-SPI bus on (wrap-a11y) before XFCE and
 # Chrome start, and supervises `wrap-a11y watch`, so agent-desktop can read the
@@ -643,8 +683,8 @@ set -eu
 
 : "${DISPLAY:=:1}"
 : "${WRAP_DESKTOP_GEOMETRY:=1280x800x24}"
-: "${WRAP_DESKTOP_VNC_PORT:=5900}"
-: "${WRAP_DESKTOP_NOVNC_PORT:=6080}"
+: "${WRAP_DESKTOP_VIEWER_PORT=6080}"
+: "${WRAP_DESKTOP_VOXL_ARGS:=}"
 : "${WRAP_DESKTOP_CDP_PORT:=9222}"
 : "${WRAP_DESKTOP_CDP_PUBLIC_PORT=9223}"
 : "${WRAP_DESKTOP_CHROME_PROFILE:=$HOME/.config/wrap-chrome}"
@@ -691,6 +731,62 @@ trust_local_cas() {
   done
 }
 cdp_up() { curl -fsS -m 1 "http://127.0.0.1:$WRAP_DESKTOP_CDP_PORT/json/version" >/dev/null 2>&1; }
+viewer_on() { case "$WRAP_DESKTOP_VIEWER_PORT" in ''|0) return 1 ;; esac; }
+viewer_up() { curl -fsS -m 1 -o /dev/null "http://127.0.0.1:$WRAP_DESKTOP_VIEWER_PORT/healthz" 2>/dev/null; }
+
+# The viewer's password: WRAP_DESKTOP_PASSWORD when set, else one made up (128
+# random bits) on the owner's first start and kept in
+# /var/lib/wrap-desktop/<uid>/password, so a saved link keeps working across
+# restarts; write your own into that file to choose it. Per uid, not per HOME:
+# a bot with a HOME of its own (same uid) must read the password the running
+# viewer has, not make up a second one. The link needs the desktop owner's
+# password, and the owner is whoever runs the X server, so owns its socket;
+# root (`docker exec` without -u) can read that file too, another uid cannot.
+password_file() { printf '/var/lib/wrap-desktop/%s/password\n' "${1:-$(id -u)}"; }
+desktop_uid() { stat -c %u "/tmp/.X11-unix/X$dpy_num" 2>/dev/null || id -u; }
+viewer_password() {
+  if [ -n "${WRAP_DESKTOP_PASSWORD:-}" ]; then
+    printf '%s\n' "$WRAP_DESKTOP_PASSWORD"
+    return 0
+  fi
+  f="$(password_file "$(desktop_uid)")"
+  [ -s "$f" ] || return 1
+  p="$(head -n 1 "$f")"
+  [ -n "$p" ] && printf '%s\n' "$p"
+}
+# Two starts racing each other both write a candidate; ln never replaces a file,
+# so whichever lands first is the password for both. A directory this uid does
+# not own is not used (the parent is sticky and world-writable, like /tmp).
+ensure_password() {
+  [ -z "${WRAP_DESKTOP_PASSWORD:-}" ] || return 0
+  f="$(password_file)"
+  [ ! -s "$f" ] || return 0
+  install -d -m 0700 "${f%/*}" && [ -O "${f%/*}" ] || return 1
+  # An empty file left behind (a full disk, a crash) is not a password.
+  if [ -e "$f" ] && [ ! -s "$f" ]; then rm -f "$f"; fi
+  tmp="$f.$$"
+  (umask 077 && od -An -N16 -tx1 /dev/urandom | tr -d ' \n' >"$tmp" && echo >>"$tmp")
+  ln "$tmp" "$f" 2>/dev/null || true
+  rm -f "$tmp"
+}
+
+# voxl on every guest interface (the port publish targets the guest NIC). The
+# password reaches it through its environment, which only its own uid can read,
+# never through argv, which any uid sees in ps. Audio is off: no sound server
+# runs here. WRAP_DESKTOP_VOXL_ARGS adds flags, e.g. --allowed-hosts=NAME to
+# answer for a proxy's host name, or --read-only.
+start_viewer() {
+  ensure_password || { say "viewer: cannot keep a password in $(password_file)"; return 1; }
+  pw="$(viewer_password)" || { say "viewer: no password in $(password_file)"; return 1; }
+  title="$(cat /proc/sys/kernel/hostname 2>/dev/null || echo wrap) desktop"
+  (
+    set -f
+    export VOXL_PASSWORD="$pw"
+    # shellcheck disable=SC2086 # a list of flags, split on purpose
+    spawn viewer voxl --addr=0.0.0.0 --port="$WRAP_DESKTOP_VIEWER_PORT" \
+      --audio-enabled=false --title="$title" $WRAP_DESKTOP_VOXL_ARGS
+  )
+}
 
 spawn() { # name cmd...
   name="$1"; shift
@@ -718,8 +814,10 @@ start() {
     say "desktop already up on $DISPLAY"
   else
     rm -f "/tmp/.X${dpy_num}-lock" "/tmp/.X11-unix/X${dpy_num}"
+    # -shmem keeps the framebuffer in a SysV segment that voxl reads in place;
+    # without it voxl copies every frame out of the server with GetImage.
     spawn xvfb Xvfb "$DISPLAY" -screen 0 "$WRAP_DESKTOP_GEOMETRY" -ac -nolisten tcp \
-      +extension GLX +extension RANDR +render -noreset
+      +extension GLX +extension RANDR +render -noreset -shmem
     i=0
     until display_up; do
       i=$((i + 1)); [ "$i" -lt 100 ] || { say "Xvfb did not come up (see $log)"; return 1; }
@@ -746,10 +844,11 @@ start() {
     spawn xfce startxfce4
     say "desktop up on $DISPLAY ($WRAP_DESKTOP_GEOMETRY)"
   fi
-  spawn x11vnc x11vnc -display "$DISPLAY" -forever -shared -nopw -noxdamage -xkb \
-    -rfbport "$WRAP_DESKTOP_VNC_PORT" -quiet
-  spawn novnc websockify --web /usr/share/novnc \
-    "0.0.0.0:$WRAP_DESKTOP_NOVNC_PORT" "127.0.0.1:$WRAP_DESKTOP_VNC_PORT"
+  # The viewer streams this uid's desktop; another uid's `start` (a `sudo -i`
+  # login shell) leaves it to the owner, as it does accessibility.
+  if viewer_on && owns_desktop; then
+    start_viewer || say "viewer did not start (see $log)"
+  fi
   # The one shared Chrome. Explicit --user-data-dir is mandatory: Chrome >= 136
   # refuses --remote-debugging-port on the default profile directory.
   if ! cdp_up; then
@@ -769,7 +868,9 @@ start() {
     spawn cdp-public socat "TCP-LISTEN:$WRAP_DESKTOP_CDP_PUBLIC_PORT,bind=0.0.0.0,reuseaddr,fork" \
       "TCP:127.0.0.1:$WRAP_DESKTOP_CDP_PORT"
   fi
-  say "vnc  :$WRAP_DESKTOP_VNC_PORT   novnc http://127.0.0.1:$WRAP_DESKTOP_NOVNC_PORT/vnc.html (via port publish)"
+  if viewer_on; then
+    say "view http://127.0.0.1:$WRAP_DESKTOP_VIEWER_PORT/ (via port publish; \`wrap-desktop url\` prints the sign-in link)"
+  fi
   say "cdp  http://127.0.0.1:$WRAP_DESKTOP_CDP_PORT  (agent-browser attaches here; :$WRAP_DESKTOP_CDP_PUBLIC_PORT on guest interfaces)"
 }
 
@@ -787,8 +888,22 @@ for a in "$@"; do [ "$a" = "--quiet" ] && quiet=1; done
 case "$cmd" in
   start)  start ;;
   stop)   stop ;;
-  status) if display_up; then say "up on $DISPLAY"; else say "down"; exit 1; fi ;;
-  url)    printf 'http://127.0.0.1:%s/vnc.html\n' "$WRAP_DESKTOP_NOVNC_PORT" ;;
+  status)
+    if ! display_up; then say "down"; exit 1; fi
+    if viewer_on && viewer_up; then say "up on $DISPLAY, viewer on :$WRAP_DESKTOP_VIEWER_PORT"
+    else say "up on $DISPLAY, viewer down"; fi ;;
+  # The sign-in link: the password rides in ?token=, which voxl's page passes on
+  # to its socket. ADDRESS is where the browser reaches the published port
+  # (default 127.0.0.1:<viewer port>); a full http(s):// URL, such as an HTTPS
+  # proxy in front of it, is used as the base instead.
+  url)
+    pw="$(viewer_password)" || { echo "wrap-desktop: no viewer password yet; start the desktop first" >&2; exit 1; }
+    base="${1:-127.0.0.1:$WRAP_DESKTOP_VIEWER_PORT}"
+    case "$base" in *://*) ;; *) base="http://$base" ;; esac
+    printf '%s/?token=%s\n' "${base%/}" "$(printf '%s' "$pw" | jq -sRr @uri)" ;;
+  # For scripts: curl -u ":$(wrap-desktop password)" localhost:6080/screenshot
+  password)
+    viewer_password || { echo "wrap-desktop: no viewer password yet; start the desktop first" >&2; exit 1; } ;;
   run)
     # Sleep in the background and `wait`: a foreground sleep defers the TERM
     # trap until it returns, so `docker stop` would always hit its kill timeout.
@@ -802,13 +917,16 @@ case "$cmd" in
         sleep 3600 & wait $! || true
       fi
     done ;;
-  # Whole-desktop capture (what a human would see over VNC), for agents that
+  # Whole-desktop capture (what a human sees in the viewer), for agents that
   # want more than agent-browser's page screenshot.
   screenshot) out="${1:-/tmp/wrap-desktop-$(date +%s).png}"; scrot -o "$out" && printf '%s\n' "$out" ;;
-  *) echo "usage: wrap-desktop start [--quiet] | stop | status | run | url | screenshot [FILE]" >&2; exit 2 ;;
+  *) echo "usage: wrap-desktop start [--quiet] | stop | status | run | url [ADDRESS] | password | screenshot [FILE]" >&2; exit 2 ;;
 esac
 EOF
-RUN chmod 0755 /opt/wrap/bin/wrap-desktop
+# Each uid keeps its viewer password in a 0700 directory of its own under this
+# sticky parent (see wrap-desktop's password_file).
+RUN chmod 0755 /opt/wrap/bin/wrap-desktop \
+ && install -d -m 1777 /var/lib/wrap-desktop
 
 # Autostart from login shells (wrap enters every session via `zsh -l`; docker
 # `-it` shells too). /etc/profile sources profile.d for sh/bash, and Arch's
@@ -827,7 +945,8 @@ RUN cat > /etc/wrap/desktop.md <<'EOF'
 # wrap desktop
 
 - X display `:1` (Xvfb, 1280x800) running XFCE. Autostarts from login shells;
-  `wrap-desktop start|stop|status|url|screenshot [FILE]` (screenshot = whole desktop).
+  `wrap-desktop start|stop|status|url|password|screenshot [FILE]` (screenshot =
+  whole desktop).
 - Local CA anchors (e.g. a TLS-intercepting sandbox's CA) are imported into
   Chrome's NSS store at start, so intercepted hosts load without cert errors.
 - One persistent Google Chrome on that desktop (no window until something opens
@@ -839,7 +958,7 @@ RUN cat > /etc/wrap/desktop.md <<'EOF'
   /etc/opt/chrome/policies/managed and /opt/google/chrome/initial_preferences.
 - agent-browser is preconfigured (~/.agent-browser/config.json, `cdp: 9222`) to
   attach to that Chrome: `agent-browser open https://example.com` acts in the
-  same browser a human sees over VNC and can take over (log in, solve a captcha,
+  same browser a human sees in the viewer and can take over (log in, solve a captcha,
   hand back). A project-level ./agent-browser.json still overrides, e.g. drop
   `cdp` to get an isolated headed Chrome instead. `agent-browser doctor` verifies.
   Pages' WebMCP tools: `agent-browser webmcp list` / `webmcp invoke <tool>`.
@@ -863,8 +982,19 @@ RUN cat > /etc/wrap/desktop.md <<'EOF'
   whole-screen capture (`wrap-desktop screenshot FILE`, `agent-desktop
   screenshot --screen 0`) cannot see the real windows. A window that is covered
   therefore cannot be captured on its own; capture the screen instead.
-- View: VNC :5900 (no password) or noVNC http://<host>:6080/vnc.html through the
-  VM's published ports (wrap: `network.ports: [6080]`; the host side is loopback).
+- View: voxl, a browser viewer (H.264 over a WebSocket), on :6080 through the
+  VM's published ports (wrap: `network.ports: [6080]`; the host side is
+  loopback). `wrap-desktop url` prints the sign-in link,
+  http://127.0.0.1:6080/?token=<password>. The password is WRAP_DESKTOP_PASSWORD,
+  else /var/lib/wrap-desktop/<uid>/password (made up on the first start, kept
+  after; `wrap-desktop password` prints it).
+  The page decodes with WebCodecs, so open it on localhost/127.0.0.1 or over
+  HTTPS; through an HTTPS proxy, pass its host name with
+  WRAP_DESKTOP_VOXL_ARGS=--allowed-hosts=NAME. Other sites' pages are refused.
+- The viewer's server also answers scripts, with the password as a Bearer token
+  or `curl -u ":$(wrap-desktop password)"`: GET localhost:6080/screenshot (PNG),
+  and /wait, which returns once the screen has been still for `idle` ms (300)
+  or, with `?change`, at the first change: no sleeping after an action.
 EOF
 
 # Anything a root build step may have left in the user's home belongs to user.
@@ -873,5 +1003,5 @@ RUN find "${WRAP_USER_HOME}" \( ! -uid "${WRAP_UID}" -o ! -gid "${WRAP_GID}" \) 
       -exec chown -h "${WRAP_UID}:${WRAP_GID}" {} +
 
 ENV HOME=/home/user USER=user
-EXPOSE 5900 6080 9223
+EXPOSE 6080 9223
 CMD ["/opt/wrap/bin/wrap-desktop", "run"]

@@ -127,21 +127,22 @@ The images declare their tools in [`resources/mise.toml`](resources/mise.toml) a
 
 Mise's `tool_update.global_auto` keeps unpinned global tools current, checking at most once every 24 hours by default. Shims update before launching a tool; interactive shells use mise's background prompt updates. Exact pins and project-selected versions are not automatically upgraded. System packages, including mise itself, are updated by pacman when the image is built.
 
-The desktop image bakes in websockify (a small venv on the system Python) so noVNC starts offline. Chrome and noVNC's static files also remain in the image.
+The desktop image builds its viewer, [voxl](https://github.com/tembo/voxl), from a pinned upstream commit in a separate build stage (voxl ships no release binaries or Arch packages). Only the binary and the four libraries it links (x264, libyuv, opus, libpulse) land in the image, and its web client is compiled into the binary, so the viewer starts offline. Chrome also remains in the image.
 
-`make test-images` builds both images and tests lazy installs, automatic upgrades, exact pins, HOME overrides, and offline desktop startup, then drives the desktop as an agent would: a GTK app typed into and clicked through `agent-desktop`, Chrome's page on the accessibility tree, a whole-screen capture, the clipboard, both CLIs under a bot's own HOME, and an accessibility bus that comes back after its launcher is killed. Use `make test-images CONTAINER_ENGINE=podman` for Podman.
+`make test-images` builds both images and tests lazy installs, automatic upgrades, exact pins, HOME overrides, and offline desktop startup, then drives the desktop as an agent would: a GTK app typed into and clicked through `agent-desktop`, Chrome's page on the accessibility tree, a whole-screen capture, the clipboard, both CLIs under a bot's own HOME, and an accessibility bus that comes back after its launcher is killed. The viewer is checked the way a person uses it: its password, the sign-in link, other sites' pages turned away, an H.264 stream that the image's own Chrome decodes, input over the socket, and a loopback port publish from the host. Use `make test-images CONTAINER_ENGINE=podman` for Podman.
 
 ## Desktop image
 
 `ghcr.io/tobi/wrap:desktop` (`Containerfile.desktop`) layers a headless desktop on the base image:
 
-- X display `:1` (Xvfb, 1280x800) running a minimal XFCE — navy backdrop, one bottom dock with Chrome, Thunar and Terminal — autostarted from login shells; `wrap-desktop start|stop|status|url`.
+- X display `:1` (Xvfb, 1280x800) running a minimal XFCE — navy backdrop, one bottom dock with Chrome, Thunar and Terminal — autostarted from login shells; `wrap-desktop start|stop|status|url|password`.
 - One persistent Google Chrome on that desktop (no window until agent-browser or the dock opens one) with CDP on `127.0.0.1:9222`, forwarded to guest interfaces on `9223` so DevTools or Playwright outside the guest can attach once you publish it. The setup speedrun is baked in system-wide: managed policies (`/etc/opt/chrome/policies/managed`) and `initial_preferences` disable sign-in, sync, default-browser, privacy-sandbox, promo, password/autofill and keyring prompts, so neither agents nor humans ever see first-run UI.
-- `agent-browser` is installed into the image (mise's native backend, so no npm/Node bootstrap) and preconfigured (`~/.agent-browser/config.json`, `cdp: 9222`) to attach to that Chrome: `agent-browser open https://example.com` acts in the same browser you see over VNC, so you can watch, log in, or take over and hand back. A project `./agent-browser.json` still overrides (drop `cdp` for an isolated headed Chrome). WebMCP is on: tools a page registers on `document.modelContext` show up in `agent-browser webmcp list` and run with `agent-browser webmcp invoke`.
+- `agent-browser` is installed into the image (mise's native backend, so no npm/Node bootstrap) and preconfigured (`~/.agent-browser/config.json`, `cdp: 9222`) to attach to that Chrome: `agent-browser open https://example.com` acts in the same browser you see in the viewer, so you can watch, log in, or take over and hand back. A project `./agent-browser.json` still overrides (drop `cdp` for an isolated headed Chrome). WebMCP is on: tools a page registers on `document.modelContext` show up in `agent-browser webmcp list` and run with `agent-browser webmcp invoke`.
 - `agent-desktop` is installed too (through mise's npm backend; the package's own postinstall is the one install script the declaration approves, and it links the native binary). It sees and drives the desktop's apps through AT-SPI: `agent-desktop list-apps`, `snapshot --app <name> -i`, `click`/`type` with the refs it printed. The accessibility bus is switched on by `wrap-a11y` (run by `wrap-desktop start` before XFCE and Chrome), because `org.a11y.Status.IsEnabled` starts false and gsettings' `toolkit-accessibility` is written *from* it, never the other way round. `wrap-desktop run` also supervises `wrap-a11y watch`, so a bus launcher that dies mid-session comes back switched on without a re-login.
 - Chrome is told to publish its web contents with `--force-renderer-accessibility` (a page appears on the accessibility tree once a window is open). xfwm4 runs with compositing off, so a whole-screen capture — `wrap-desktop screenshot FILE` or `agent-desktop screenshot --screen 0` — sees the real windows instead of the compositor's stage.
 - Chrome launch flags live in `~/.config/chrome-flags.conf`, one per line, falling back to `/etc/wrap/chrome-flags.conf`. The defaults are `--no-sandbox` and `--enable-features=WebMCPTesting,DevToolsWebMCPSupport`; Chrome honors only the last `--enable-features`, so keep both features in any line that replaces it.
-- View it over noVNC at `http://127.0.0.1:6080/vnc.html` (or VNC on 5900, no password) by publishing the ports in `~/.config/wrap/config.yml`; the host side is loopback-only.
+- View and drive it in a browser with [voxl](https://github.com/tembo/voxl) on port 6080: the desktop as H.264 over one WebSocket (decoded with WebCodecs), with keyboard, mouse, clipboard and file transfers back. Publish the port in `~/.config/wrap/config.yml` (the host side is loopback-only) and open the link `wrap-desktop url` prints, `http://127.0.0.1:6080/?token=…`. The password is `WRAP_DESKTOP_PASSWORD`, else one made up on the first start and kept in `/var/lib/wrap-desktop/<uid>/password` (`wrap-desktop password` prints it). Everything but `/healthz` and the page's scripts needs it, and voxl turns away other sites' pages.
+- The viewer page decodes with WebCodecs, which browsers only allow in a secure context: open it on `127.0.0.1`/`localhost` or over HTTPS, not plain HTTP on another address. Behind an HTTPS proxy such as `tailscale serve`, pass `wrap-desktop url https://NAME` and let voxl answer for the name with `WRAP_DESKTOP_VOXL_ARGS=--allowed-hosts=NAME` (it takes any `voxl --help` flag, e.g. `--read-only`). `WRAP_DESKTOP_VIEWER_PORT` moves it (empty or `0` disables it). Scripts and agents can use the same server, e.g. `curl -u ":$(wrap-desktop password)" localhost:6080/screenshot`, or `/wait`, which returns once the screen has settled.
 
 Use it from wrap:
 
@@ -150,17 +151,19 @@ Use it from wrap:
 sandbox:
   image: ghcr.io/tobi/wrap:desktop
 network:
-  ports: [6080]        # host 127.0.0.1:6080 -> guest noVNC; "HOST:GUEST" also works
+  ports: [6080]        # host 127.0.0.1:6080 -> guest viewer; "HOST:GUEST" also works
 ```
 
 ```bash
-wrap -- agent-browser open https://example.com     # then open http://127.0.0.1:6080/vnc.html
+wrap -- agent-browser open https://example.com     # acts in the shared desktop Chrome
+wrap -- wrap-desktop url                           # open this link to watch or take over
 ```
 
 Or standalone:
 
 ```bash
 docker run -d -p 127.0.0.1:6080:6080 ghcr.io/tobi/wrap:desktop   # desktop + chrome
+docker exec <container> wrap-desktop url                         # the viewer's sign-in link
 docker run -d -p 127.0.0.1:9222:9223 ghcr.io/tobi/wrap:desktop   # + CDP at host 127.0.0.1:9222
 docker run -it ghcr.io/tobi/wrap:desktop                         # shell as `user`; desktop autostarts
 ```
