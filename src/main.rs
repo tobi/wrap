@@ -1578,7 +1578,7 @@ async fn create_session(
     for (key, value) in &cfg.env {
         builder = builder.env(key, value);
     }
-    // Published to the host loopback only (e.g. the desktop image's noVNC).
+    // Published to the host loopback only (e.g. the desktop image's viewer).
     for port in &cfg.network.ports {
         builder = builder.port(port.host, port.guest);
     }

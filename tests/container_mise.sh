@@ -113,9 +113,6 @@ else
   test "$(mise ls npm:agent-desktop | awk '/latest/ {print $2; exit}')" = "$current"
   ok "four bot HOMEs updated one tool at once ($updates of them installed it)"
 
-  MISE_OFFLINE=1 websockify --help >/dev/null
-  ok 'websockify is ready offline'
-
   MISE_OFFLINE=1 wrap-desktop start --quiet
   MISE_OFFLINE=1 agent-browser open about:blank
   ok 'native agent-browser attaches to the preconfigured shared Chrome desktop'
